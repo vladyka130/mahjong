@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual Environment
+venv/
+env/
+ENV/
+
+# Database files (encrypted)
+*.enc
+*.tmp
+mahjong_db.enc
+mahjong_db.tmp
+
+# User data
+remember_me.dat
+records.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test files (optional - можна залишити для тестування)
+# test_leaderboard_data.py
+
