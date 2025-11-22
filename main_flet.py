@@ -817,8 +817,9 @@ class Board:
 def main(page: ft.Page):
     """Головна функція Flet додатку"""
     page.title = "Mahjong Solitaire"
+    # Встановлюємо розмір вікна, щоб поміщалося на більшості моніторів
     page.window.width = 1400
-    page.window.height = 800  # Висота для 10 рядів: 50 (відступ) + 10*71 + 40 (відступ) = 800
+    page.window.height = 800
     page.bgcolor = BACKGROUND_COLOR
     page.scroll = ft.ScrollMode.AUTO  # Додаємо прокрутку
     
@@ -905,11 +906,11 @@ def main(page: ft.Page):
         heading_row_height=30,
         data_row_min_height=35,
         data_row_max_height=35,
-        border=ft.border.all(1, "#888888"),
-        divider_thickness=1,
-        width=260,
-        horizontal_lines=ft.border.BorderSide(1, "#888888"),
-        vertical_lines=ft.border.BorderSide(1, "#888888"),
+        border=None,  # Прибрано border
+        divider_thickness=0,  # Прибрано divider
+        width=176,  # Зменшено до ширини sidebar (200px) мінус padding (12px * 2 = 24px) = 176px
+        horizontal_lines=None,  # Прибрано горизонтальні лінії
+        vertical_lines=None,  # Прибрано вертикальні лінії
     )
     reshuffle_prompt_open = False
     reshuffle_dialog: Optional[ft.AlertDialog] = None
@@ -1091,6 +1092,9 @@ def main(page: ft.Page):
         game_records = fetch_profile_records(profile["id"])
         refresh_records_table()
         refresh_profile_stats()
+        
+        # Оновлюємо sidebar, щоб показати таблицю рекордів
+        update_sidebar()
         
         # Приховуємо overlay входу
         if auth_overlay_container:
@@ -1680,30 +1684,148 @@ def main(page: ft.Page):
         on_click=admin_remove_10_tiles,
     )
     
+    # Кнопка Support з модальним вікном
+    support_overlay: Optional[ft.Container] = None
+    
+    def close_support():
+        """Закриває модальне вікно підтримки"""
+        nonlocal support_overlay
+        if support_overlay:
+            support_overlay.visible = False
+            if support_overlay in page.overlay:
+                page.overlay.remove(support_overlay)
+            page.update()
+    
+    def show_support(e):
+        """Показує модальне вікно з контактною інформацією"""
+        nonlocal support_overlay
+        if support_overlay is None:
+            support_overlay = ft.Container(
+                expand=True,
+                bgcolor="#000000DD",
+                alignment=ft.alignment.center,
+                content=ft.Container(
+                    width=450,
+                    height=250,
+                    padding=20,
+                    bgcolor="#1E1E1E",
+                    border_radius=10,
+                    content=ft.Column(
+                        [
+                            ft.Text("Підтримка", size=18, weight=ft.FontWeight.BOLD, color="#FFFFFF"),
+                            ft.Divider(height=10),
+                            ft.Text("Якщо у вас виникли питання або пропозиції, зв'яжіться з нами:", size=14, color="#FFFFFF"),
+                            ft.Divider(height=10),
+                            ft.Row(
+                                [
+                                    ft.Text("Email: ", size=14, weight=ft.FontWeight.BOLD, color="#FFFFFF"),
+                                    ft.Text("music319@gmail.com", size=14, color="#4CAF50", selectable=True),
+                                ],
+                                spacing=8,
+                            ),
+                            ft.Container(height=20),
+                            ft.ElevatedButton("Закрити", on_click=lambda e: close_support(), width=150),
+                        ],
+                        spacing=8,
+                        tight=True,
+                    ),
+                ),
+                visible=False,
+            )
+        
+        if support_overlay not in page.overlay:
+            page.overlay.append(support_overlay)
+        support_overlay.visible = True
+        page.update()
+    
+    support_button = ft.ElevatedButton(
+        "Support",
+        width=180,
+        bgcolor="#2196F3",
+        color="#FFFFFF",
+        on_click=show_support,
+    )
+    
+    # Розділяємо sidebar на 3 частини
+    # Частина 1: Інформація про користувача та кнопки
+    sidebar_part1 = ft.Container(
+        content=ft.Column(
+            [
+                profile_label,
+                ft.Row([games_label, best_time_label], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+                hint_button,
+                shuffle_button,
+                pause_button,
+                leaderboard_button,
+                admin_button,  # Адмінська кнопка для тестування
+                ft.Divider(height=1, color="#2b2b2b"),
+                ft.Text("Таймер", size=16, weight=ft.FontWeight.BOLD, color=TEXT_COLOR),
+                timer_text,
+            ],
+            spacing=12,
+            tight=True,
+        ),
+        padding=ft.padding.all(12),
+    )
+    
+    # Частина 2: Таблиця рекордів у своєму фреймі
+    sidebar_part2 = ft.Container(
+        content=ft.Column(
+            [
+                ft.Text("Рекорди", size=16, weight=ft.FontWeight.BOLD, color=TEXT_COLOR),
+                ft.Container(
+                    content=records_table,
+                    height=200,  # Фіксована висота для таблиці
+                    border=None,  # Прибрано border з контейнера
+                    padding=ft.padding.all(0),  # Зменшено padding
+                    clip_behavior=ft.ClipBehavior.HARD_EDGE,  # Обрізаємо вміст, якщо не поміщається
+                ),
+            ],
+            spacing=8,
+            tight=True,
+        ),
+        padding=ft.padding.symmetric(horizontal=12, vertical=8),
+        visible=False,  # Початково прихована, поки користувач не увійде
+    )
+    
+    # Divider для таблиці рекордів
+    sidebar_part2_divider = ft.Divider(height=1, color="#2b2b2b", visible=False)
+    
+    # Частина 3: Кнопка Support внизу (завжди видима)
+    sidebar_part3 = ft.Container(
+        content=support_button,
+        padding=ft.padding.all(12),
+        alignment=ft.alignment.center,
+    )
+    
+    # Створюємо динамічний sidebar, який змінюється залежно від стану входу
+    def update_sidebar():
+        """Оновлює вміст sidebar залежно від стану входу користувача"""
+        # Показуємо/приховуємо таблицю рекордів залежно від стану входу
+        if current_profile["id"] is not None:
+            sidebar_part2.visible = True
+            sidebar_part2_divider.visible = True
+        else:
+            sidebar_part2.visible = False
+            sidebar_part2_divider.visible = False
+        page.update()
+    
     sidebar = ft.Container(
-        width=220,
+        width=200,  # Зменшено з 220 до 200
         height=780,
         bgcolor=UI_PANEL_COLOR,
-        padding=ft.padding.all(12),
         border=ft.border.all(1, "#2b2b2b"),
         border_radius=10,
         content=ft.Column(
-                [
-                    profile_label,
-                    ft.Row([games_label, best_time_label], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
-                    hint_button,
-                    shuffle_button,
-                    pause_button,
-                    leaderboard_button,
-                    admin_button,  # Адмінська кнопка для тестування
-                    ft.Divider(height=1, color="#2b2b2b"),
-                    ft.Text("Таймер", size=16, weight=ft.FontWeight.BOLD, color=TEXT_COLOR),
-                    timer_text,
-                    ft.Divider(height=1, color="#2b2b2b"),
-                    ft.Text("Рекорди", size=16, weight=ft.FontWeight.BOLD, color=TEXT_COLOR),
-                    records_table,
-                ],
-            spacing=12,
+            [
+                sidebar_part1,  # Верхня частина - інформація та кнопки
+                sidebar_part2_divider,  # Divider для таблиці рекордів
+                sidebar_part2,  # Середня частина - таблиця рекордів (початково прихована)
+                ft.Divider(height=1, color="#2b2b2b"),  # Divider перед кнопкою Support
+                sidebar_part3,  # Нижня частина - кнопка Support завжди видима
+            ],
+            spacing=0,
+            expand=True,  # Дозволяє Column займати весь доступний простір
         ),
     )
     content_row = ft.Row(
@@ -1852,6 +1974,9 @@ def main(page: ft.Page):
         check_game_state()
 
     initialize_start_button()
+    
+    # Початкове оновлення sidebar (без таблиці рекордів, якщо користувач не увійшов)
+    update_sidebar()
     
     # Початкове оновлення
     update_board()
