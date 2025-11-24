@@ -1212,7 +1212,6 @@ def main(page: ft.Page):
     solitaire2_slots: List[Optional[Tile]] = [None, None, None]  # Три слоти для тейлів у Пасьянс 2 (третій заблокований)
     solitaire2_last_move: Optional[Dict[str, Any]] = None  # Останній хід для відміни: {"tile": Tile, "x": int, "y": int, "z": int, "slot_index": int} або None
     solitaire2_pending_removal: bool = False  # Прапор, що вказує, що чекаємо перед видаленням однакових тейлів
-    darken_mode: bool = True  # Глобальний режим затемнення закритих тейлів (за замовчуванням увімкнено)
     selected_solitaire2_pattern: Optional[str] = None  # Вибраний патерн для solitaire2
     selected_solitaire2_pattern: Optional[str] = None  # Вибраний патерн для solitaire2
     timer_text = ft.Text("00:00", size=24, weight=ft.FontWeight.BOLD, color=TEXT_COLOR)
@@ -1564,17 +1563,10 @@ def main(page: ft.Page):
             return
         stats = fetch_profile_stats(current_profile["id"])
         games_label.value = f"Ігор: {stats['games']}"
-        # Форматуємо час і дату кращого рекорду на одній лінії з відступом
-        if stats.get("best") is not None and stats.get("best_date"):
-            try:
-                dt = datetime.fromisoformat(stats["best_date"].replace('Z', '+00:00'))
-                date_text = dt.strftime("%d.%m.%Y")
-                time_text = format_duration(stats["best"])
-                sidebar_best_date_label.value = f"{time_text}                {date_text}"  # Відступ між часом і датою
-            except:
-                sidebar_best_date_label.value = format_duration(stats["best"]) if stats.get("best") else "--"
-        elif stats.get("best") is not None:
-            sidebar_best_date_label.value = format_duration(stats["best"])
+        # Форматуємо дату кращого рекорду
+        if stats.get("best_date"):
+            date_text = format_timestamp(stats["best_date"])
+            sidebar_best_date_label.value = date_text
         else:
             sidebar_best_date_label.value = "--"
 
@@ -1761,7 +1753,7 @@ def main(page: ft.Page):
 
     def start_new_game(e=None, show_notification=True):
         nonlocal board, hints_remaining, shuffle_remaining, timer_started, elapsed_seconds, start_time
-        nonlocal current_session_id, solitaire2_slots, finish_text_container, darken_mode
+        nonlocal current_session_id, solitaire2_slots, finish_text_container
         global game_mode
         timer_control.stop()
         # Створюємо нову дошку з поточним game_mode (який вже встановлений)
@@ -3016,10 +3008,7 @@ def main(page: ft.Page):
                     content=ft.Column(
                         [
                             ft.Text("Таймер", size=16, weight=ft.FontWeight.BOLD, color=TEXT_COLOR),
-                            ft.Container(
-                                content=timer_text,
-                                padding=ft.padding.only(left=5),  # Зсуваємо час вправо на 5 пікселів
-                            ),
+                            timer_text,
                         ],
                         horizontal_alignment=ft.CrossAxisAlignment.CENTER,
                         spacing=8,
@@ -3209,9 +3198,9 @@ def main(page: ft.Page):
             border_width = 1 if tile.selected else 0  # Тонка обводка 1 піксель для вибраних тейлів
             tile_bgcolor = TILE_COLOR
 
-        # Для Пасьянс-2: затемнюємо тейли, які закриті з обох сторін АБО зверху (якщо режим увімкнено)
+        # Для Пасьянс-2: затемнюємо тейли, які закриті з обох сторін АБО зверху
         is_darkened = False
-        if game_mode == "solitaire2" and darken_mode:
+        if game_mode == "solitaire2":
             is_darkened = is_tile_darkened_solitaire2(tile)
 
         if tile.tile_type in tile_images:
@@ -3464,13 +3453,6 @@ def main(page: ft.Page):
         update_board()
         page.update()
     
-    def toggle_darken_mode():
-        """Перемикає глобальний режим затемнення закритих тейлів"""
-        nonlocal darken_mode
-        darken_mode = not darken_mode
-        update_board()
-        page.update()
-    
     start_button: Optional[ft.ElevatedButton]
     solitaire2_button: Optional[ft.ElevatedButton]
     duel_button: Optional[ft.ElevatedButton]
@@ -3679,7 +3661,7 @@ def main(page: ft.Page):
     def update_board():
         """Оновлює відображення дошки"""
         global game_mode
-        nonlocal main_stack, sidebar_slots_area, tile_palette_container, solitaire2_last_move, darken_mode
+        nonlocal main_stack, sidebar_slots_area, tile_palette_container, solitaire2_last_move
         print(f"DEBUG update_board: current_profile['id']={current_profile['id']}")
         print(f"DEBUG update_board: start_button={start_button}, start_button.visible={start_button.visible if start_button else 'None'}")
         print(f"DEBUG update_board: duel_button={duel_button}, duel_button.visible={duel_button.visible if duel_button else 'None'}")
@@ -3943,28 +3925,6 @@ def main(page: ft.Page):
                         # Додаємо до прозорої частини сайдбару
                         sidebar_slots_area.content.controls.append(locked_slot)
                         continue
-                
-                # Створюємо кнопку перемикання режиму затемнення над кнопкою undo
-                # slot_y_start - це Y координата першої комірки, відступаємо на 174px вгору
-                darken_button_y = slot_y_start - 172
-                darken_button = ft.Container(
-                    content=ft.IconButton(
-                        icon="visibility" if darken_mode else "visibility_off",
-                        icon_size=32,
-                        icon_color=TEXT_COLOR if darken_mode else "#666666",
-                        tooltip="Вимкнути затемнення" if darken_mode else "Увімкнути затемнення",
-                        on_click=lambda e: toggle_darken_mode(),
-                    ),
-                    left=slot_x,
-                    top=darken_button_y,
-                    width=TILE_WIDTH,
-                    height=TILE_HEIGHT,
-                    border=ft.border.all(2, "#888888" if darken_mode else "#666666"),
-                    border_radius=5,
-                    bgcolor="#2A2A2A",
-                    alignment=ft.alignment.center,
-                )
-                sidebar_slots_area.content.controls.append(darken_button)
                 
                 # Створюємо кнопку "відмінити хід" над комірками (після створення комірок)
                 # slot_y_start - це Y координата першої комірки, відступаємо на 100px вгору
