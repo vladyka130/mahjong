@@ -8,7 +8,6 @@ import json
 import random
 import threading
 import time
-import winsound
 import sqlite3
 import hashlib
 import secrets
@@ -18,11 +17,23 @@ from typing import Any, List, Tuple, Optional, Dict
 from collections import deque
 from datetime import datetime
 
+# Умовний імпорт winsound (тільки на Windows)
+try:
+    import winsound
+    HAS_WINSOUND = True
+except ImportError:
+    HAS_WINSOUND = False
+    winsound = None
+
 # Константи
 TILE_WIDTH = 50
 TILE_HEIGHT = 70
 TILE_SPACING_X = 51  # Щільно, але без накладання (ширина плитки 50px)
 TILE_SPACING_Y = 71  # Щільно, але без накладання (висота плитки 70px)
+SOLITAIRE2_SLOTS_OFFSET_RIGHT = 100  # Статичний відступ комірок вправо для Пасьянс 2
+
+# Глобальна змінна для режиму гри
+game_mode: str = "solitaire1"  # За замовчуванням - Пасьянс 1
 
 # Кольори (Flet формат)
 BACKGROUND_COLOR = "#145014"
@@ -258,7 +269,7 @@ def insert_profile_record(profile_id: int, duration: int, timestamp: Optional[st
     save_encrypted_db(db_path)
 
 
-def fetch_profile_stats(profile_id: int) -> Dict[str, Optional[int]]:
+def fetch_profile_stats(profile_id: int) -> Dict[str, Any]:
     db_path = load_encrypted_db()
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
@@ -267,12 +278,22 @@ def fetch_profile_stats(profile_id: int) -> Dict[str, Optional[int]]:
         (profile_id,),
     )
     row = cursor.fetchone()
+    best_date = None
+    if row and row[1] is not None:
+        # Знаходимо дату кращого рекорду
+        cursor.execute(
+            "SELECT timestamp FROM records WHERE profile_id = ? AND duration = ? ORDER BY timestamp DESC LIMIT 1",
+            (profile_id, row[1]),
+        )
+        date_row = cursor.fetchone()
+        if date_row:
+            best_date = date_row[0]
     conn.close()
     save_encrypted_db(db_path)
     if not row:
-        return {"games": 0, "best": None, "worst": None}
+        return {"games": 0, "best": None, "worst": None, "best_date": None}
     games, best, worst = row
-    return {"games": games or 0, "best": best, "worst": worst}
+    return {"games": games or 0, "best": best, "worst": worst, "best_date": best_date}
 
 
 def fetch_leaderboard(limit: int = 10) -> List[Dict[str, Any]]:
@@ -576,6 +597,7 @@ class Board:
         self.width = 20
         self.height = 10
         self.game_over = False
+        self.selected_pattern_name: Optional[str] = None  # Вибраний патерн для solitaire2
         self.basic_tile_types = [
             TileType.BAMBOO_1, TileType.BAMBOO_2, TileType.BAMBOO_3, TileType.BAMBOO_4,
             TileType.BAMBOO_5, TileType.BAMBOO_6, TileType.BAMBOO_7, TileType.BAMBOO_8, TileType.BAMBOO_9,
@@ -585,12 +607,35 @@ class Board:
             TileType.WAN_5, TileType.WAN_6, TileType.WAN_7, TileType.WAN_8, TileType.WAN_9,
             TileType.EAST, TileType.SOUTH, TileType.WEST, TileType.NORTH,
             TileType.RED_DRAGON, TileType.GREEN_DRAGON, TileType.WHITE_DRAGON,
+            # Квіти та сезони
+            TileType.FLOWER_PLUM, TileType.FLOWER_ORCHID, TileType.FLOWER_CHRYSANTHEMUM, TileType.FLOWER_BAMBOO,
+            TileType.SEASON_SPRING, TileType.SEASON_SUMMER, TileType.SEASON_AUTUMN, TileType.SEASON_WINTER,
         ]
         self.generate_board()
         
     def generate_board(self):
         """Генерує дошку з плитками у вигляді патерну, повторюючи тасування поки є хід"""
-        pair_count = 100
+        global game_mode
+        pattern = self._create_pyramid_pattern()
+        
+        # Підраховуємо кількість місць для тейлів у патерні
+        total_tile_positions = 0
+        for layer in pattern:
+            for row in layer:
+                total_tile_positions += sum(1 for cell in row if cell)
+        
+        if game_mode == "solitaire2":
+            # Для Пасьянс 2 використовуємо кількість з патерну
+            # Якщо кількість непарна, додаємо один тейл для пари
+            if total_tile_positions % 2 != 0:
+                total_tile_positions += 1
+                print(f"DEBUG generate_board: Кількість тейлів непарна, додано один тейл. Тепер: {total_tile_positions}")
+            
+            pair_count = total_tile_positions // 2
+        else:
+            # Для інших режимів - 100 пар (200 тейлів)
+            pair_count = 100
+        
         pair_choices = [random.choice(self.basic_tile_types) for _ in range(pair_count)]
         tiles = []
         for tile_type in pair_choices:
@@ -602,15 +647,28 @@ class Board:
             self.tiles = []
             board_tiles = tiles.copy()
             random.shuffle(board_tiles)
-        pattern = self._create_pyramid_pattern()
-        
-        tile_index = 0
-        for z, layer in enumerate(pattern):
-            for y, row in enumerate(layer):
-                for x, has_tile in enumerate(row):
+            
+            # Логування для діагностики (тільки для першої спроби)
+            if attempt == 0:
+                print(f"DEBUG generate_board: game_mode={game_mode}, pattern layers={len(pattern)}")
+                for z, layer in enumerate(pattern):
+                    tile_count = sum(sum(1 for cell in row if cell) for row in layer)
+                    print(f"DEBUG generate_board: Шар {z}: {len(layer)} рядків, {tile_count} тейлів")
+            
+            tile_index = 0
+            for z, layer in enumerate(pattern):
+                for y, row in enumerate(layer):
+                    for x, has_tile in enumerate(row):
                         if has_tile and tile_index < len(board_tiles):
                             self.tiles.append(Tile(board_tiles[tile_index], x, y, z))
-                        tile_index += 1
+                            tile_index += 1
+            
+            # Логування після розміщення (тільки для першої спроби)
+            if attempt == 0:
+                tiles_by_z = {}
+                for tile in self.tiles:
+                    tiles_by_z[tile.z] = tiles_by_z.get(tile.z, 0) + 1
+                print(f"DEBUG generate_board: Розміщено тейлів по рівнях: {tiles_by_z}")
 
             if not self.is_game_lost():
                 self.width = len(pattern[0][0])
@@ -620,17 +678,139 @@ class Board:
         print("WARNING: Не вдалося згенерувати дошку з ходом за", max_attempts, "спроб")
     
     def _create_pyramid_pattern(self) -> List[List[List[bool]]]:
-        """Створює простий патерн 20x10 плиток"""
-        # Простий прямокутник: 20 плиток по горизонталі, 10 по вертикалі
+        """Створює патерн з 1-3 шарами залежно від режиму"""
+        global game_mode
+        
+        if game_mode == "solitaire2":
+            # Для Пасьянс 2 використовуємо збережені патерни або класичний патерн "Turtle"
+            # Якщо вказано конкретний патерн, завантажуємо його
+            saved_pattern = self._load_random_saved_pattern(self.selected_pattern_name)
+            if saved_pattern:
+                return saved_pattern
+            # Якщо немає збережених патернів, використовуємо класичний патерн "Turtle"
+            return self._create_turtle_pattern()
+        else:
+            # Для інших режимів - один шар
+            layer0 = []
+            for y in range(10):
+                row = [True] * 20
+                layer0.append(row)
+            return [layer0]
+    
+    def _load_random_saved_pattern(self, pattern_name: Optional[str] = None) -> Optional[List[List[List[bool]]]]:
+        """Завантажує збережений патерн для solitaire2. Якщо pattern_name вказано, завантажує конкретний патерн, інакше - випадковий"""
+        patterns_dir = Path("patterns")
+        if not patterns_dir.exists():
+            return None
+        
+        # Знаходимо всі JSON файли з патернами
+        pattern_files = list(patterns_dir.glob("*.json"))
+        if not pattern_files:
+            return None
+        
+        # Якщо вказано конкретний патерн, шукаємо його
+        if pattern_name:
+            pattern_file = None
+            for pf in pattern_files:
+                try:
+                    with open(pf, "r", encoding="utf-8") as f:
+                        pattern_data = json.load(f)
+                    if pattern_data.get("name", pf.stem) == pattern_name:
+                        pattern_file = pf
+                        break
+                except:
+                    if pf.stem == pattern_name:
+                        pattern_file = pf
+                        break
+            
+            if not pattern_file:
+                print(f"DEBUG _load_random_saved_pattern: Патерн '{pattern_name}' не знайдено, використовую випадковий")
+                pattern_file = random.choice(pattern_files)
+        else:
+            # Вибираємо випадковий файл
+            pattern_file = random.choice(pattern_files)
+        
+        try:
+            with open(pattern_file, "r", encoding="utf-8") as f:
+                pattern_data = json.load(f)
+            
+            # Перевіряємо структуру даних
+            if "layers" not in pattern_data:
+                print(f"DEBUG _load_random_saved_pattern: Некоректний формат файлу {pattern_file}")
+                return None
+            
+            # Конвертуємо патерн у формат List[List[List[bool]]]
+            layers = pattern_data["layers"]
+            # Переконуємося, що це список списків списків булевих значень
+            converted_layers = []
+            for layer in layers:
+                converted_layer = []
+                for row in layer:
+                    converted_row = [bool(cell) for cell in row]
+                    converted_layer.append(converted_row)
+                converted_layers.append(converted_layer)
+            
+            print(f"DEBUG _load_random_saved_pattern: Завантажено патерн '{pattern_data.get('name', 'unknown')}' з {len(converted_layers)} шарами")
+            return converted_layers
+        except Exception as e:
+            print(f"DEBUG _load_random_saved_pattern: Помилка завантаження {pattern_file}: {e}")
+            return None
+    
+    def _create_turtle_pattern(self) -> List[List[List[bool]]]:
+        """Створює патерн схожий на скрін - більш щільний з меншими відступами"""
+        pattern = []
+        
+        # Шар 0 (нижній) - найбільший, починається зверху
         layer0 = []
+        # Починаємо одразу з тейлів (без відступів зверху)
+        layer0.append([False, False, True, True, True, True, True, True, True, True, True, True, True, True, True, True, False, False])
+        layer0.append([False, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, False])
+        layer0.append([True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True])
+        layer0.append([True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True])
+        layer0.append([True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True])
+        layer0.append([True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True])
+        layer0.append([True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True])
+        layer0.append([False, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, False])
+        layer0.append([False, False, True, True, True, True, True, True, True, True, True, True, True, True, True, True, False, False])
+        layer0.append([False, False, False, True, True, True, True, True, True, True, True, True, True, True, True, False, False, False])
+        # Відступи знизу (1 рядок)
+        layer0.append([False] * 18)
+        pattern.append(layer0)
         
-        # Створюємо 10 рядків по 20 плиток
-        for y in range(10):
-            row = [True] * 20  # 20 плиток у кожному рядку
-            layer0.append(row)
+        # Шар 1 (середній) - менший, з невеликими відступами
+        layer1 = []
+        # Відступи зверху (1 рядок)
+        layer1.append([False] * 18)
+        # Основні рядки
+        layer1.append([False, False, False, True, True, True, True, True, True, True, True, True, True, True, True, False, False, False])
+        layer1.append([False, False, True, True, True, True, True, True, True, True, True, True, True, True, True, True, False, False])
+        layer1.append([False, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, False])
+        layer1.append([False, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, False])
+        layer1.append([False, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, False])
+        layer1.append([False, False, True, True, True, True, True, True, True, True, True, True, True, True, True, True, False, False])
+        layer1.append([False, False, False, True, True, True, True, True, True, True, True, True, True, True, True, False, False, False])
+        # Відступи знизу (1 рядок)
+        layer1.append([False] * 18)
+        pattern.append(layer1)
         
-        # Повертаємо один шар
-        return [layer0]
+        # Шар 2 (верхній) - найменший
+        layer2 = []
+        # Відступи зверху (2 рядки)
+        for y in range(2):
+            layer2.append([False] * 18)
+        # Основні рядки
+        layer2.append([False, False, False, False, True, True, True, True, True, True, True, True, True, True, False, False, False, False])
+        layer2.append([False, False, False, True, True, True, True, True, True, True, True, True, True, True, True, False, False, False])
+        layer2.append([False, False, True, True, True, True, True, True, True, True, True, True, True, True, True, True, False, False])
+        layer2.append([False, False, True, True, True, True, True, True, True, True, True, True, True, True, True, True, False, False])
+        layer2.append([False, False, False, True, True, True, True, True, True, True, True, True, True, True, True, False, False, False])
+        layer2.append([False, False, False, False, True, True, True, True, True, True, True, True, True, True, False, False, False, False])
+        # Відступи знизу (2 рядки)
+        for y in range(2):
+            layer2.append([False] * 18)
+        pattern.append(layer2)
+        
+        return pattern
     
     def is_tile_available(self, tile: Tile) -> bool:
         """Перевіряє, чи плитка доступна (немає плиток зверху + хоч один берег вільний/має пару)"""
@@ -738,6 +918,7 @@ class Board:
     
     def click_tile(self, tile: Tile):
         """Обробляє клік по плитці"""
+        global game_mode
         if self.game_over:
             return
         if tile.removed:
@@ -749,30 +930,63 @@ class Board:
                 self.selected_tile = None
             return
         
-        if self.selected_tile is None:
-            self.selected_tile = tile
-            tile.selected = True
-        elif self.selected_tile is tile:
-            self.selected_tile.selected = False
-            self.selected_tile = None
-        elif self.selected_tile.tile_type == tile.tile_type:
-            if (
-                self.is_tile_available(self.selected_tile)
-                and self.is_tile_available(tile)
-                and self.can_connect(self.selected_tile, tile)
-            ):
-                self.selected_tile.removed = True
-                tile.removed = True
+        # Для Пасьянс 1: дозволяємо виділяти будь-який доступний тейл, але видаляємо тільки однакові
+        if game_mode == "solitaire1":
+            if self.selected_tile is None:
+                # Вибираємо перший тейл
+                self.selected_tile = tile
+                tile.selected = True
+            elif self.selected_tile is tile:
+                # Скасовуємо вибір, якщо клікнули на той самий тейл
                 self.selected_tile.selected = False
                 self.selected_tile = None
+            elif self.selected_tile.tile_type == tile.tile_type:
+                # Знайдено однакові тейли - видаляємо їх
+                if (
+                    self.is_tile_available(self.selected_tile)
+                    and self.is_tile_available(tile)
+                    and self.can_connect(self.selected_tile, tile)
+                ):
+                    self.selected_tile.removed = True
+                    tile.removed = True
+                    self.selected_tile.selected = False
+                    self.selected_tile = None
+                else:
+                    # Якщо не можна з'єднати, вибираємо новий тейл
+                    self.selected_tile.selected = False
+                    self.selected_tile = tile
+                    tile.selected = True
             else:
+                # Вибираємо інший тейл
                 self.selected_tile.selected = False
                 self.selected_tile = tile
                 tile.selected = True
         else:
-            self.selected_tile.selected = False
-            self.selected_tile = tile
-            tile.selected = True
+            # Для інших режимів (Пасьянс 2) - стандартна логіка
+            if self.selected_tile is None:
+                self.selected_tile = tile
+                tile.selected = True
+            elif self.selected_tile is tile:
+                self.selected_tile.selected = False
+                self.selected_tile = None
+            elif self.selected_tile.tile_type == tile.tile_type:
+                if (
+                    self.is_tile_available(self.selected_tile)
+                    and self.is_tile_available(tile)
+                    and self.can_connect(self.selected_tile, tile)
+                ):
+                    self.selected_tile.removed = True
+                    tile.removed = True
+                    self.selected_tile.selected = False
+                    self.selected_tile = None
+                else:
+                    self.selected_tile.selected = False
+                    self.selected_tile = tile
+                    tile.selected = True
+            else:
+                self.selected_tile.selected = False
+                self.selected_tile = tile
+                tile.selected = True
     
     def has_possible_moves(self) -> bool:
         """Чи є хоча б одна пара, яку можна з’єднати з <= max_turns поворотів"""
@@ -819,53 +1033,111 @@ def main(page: ft.Page):
     page.title = "Mahjong Solitaire"
     # Встановлюємо розмір вікна, щоб поміщалося на більшості моніторів
     page.window.width = 1400
-    page.window.height = 800
+    page.window.height = 790  # Збільшено висоту на 30 пікселів, щоб прибрати скрол
     page.bgcolor = BACKGROUND_COLOR
-    page.scroll = ft.ScrollMode.AUTO  # Додаємо прокрутку
+    page.scroll = ft.ScrollMode.HIDDEN  # Прибрано скрол - висота статична
+    page.padding = 0  # Прибрано padding, щоб не було пустого поля
     
     initialize_db()
     board = Board()
     
     # Завантаження зображень плиток
     tile_images = {}
+    # Спочатку пробуємо папку з 3D тейлами (fulltiles), якщо немає - використовуємо оригінальну
+    tiles_dir_3d = Path("assets/fulltiles")
     tiles_dir = Path("assets/tiles")
     
-    tile_file_mapping = {
-        TileType.BAMBOO_1: ["Sou1.png", "sou1.png", "SOU1.png"],
-        TileType.BAMBOO_2: ["Sou2.png", "sou2.png", "SOU2.png"],
-        TileType.BAMBOO_3: ["Sou3.png", "sou3.png", "SOU3.png"],
-        TileType.BAMBOO_4: ["Sou4.png", "sou4.png", "SOU4.png"],
-        TileType.BAMBOO_5: ["Sou5.png", "sou5.png", "SOU5.png"],
-        TileType.BAMBOO_6: ["Sou6.png", "sou6.png", "SOU6.png"],
-        TileType.BAMBOO_7: ["Sou7.png", "sou7.png", "SOU7.png"],
-        TileType.BAMBOO_8: ["Sou8.png", "sou8.png", "SOU8.png"],
-        TileType.BAMBOO_9: ["Sou9.png", "sou9.png", "SOU9.png"],
-        TileType.DOT_1: ["Pin1.png", "pin1.png", "PIN1.png"],
-        TileType.DOT_2: ["Pin2.png", "pin2.png", "PIN2.png"],
-        TileType.DOT_3: ["Pin3.png", "pin3.png", "PIN3.png"],
-        TileType.DOT_4: ["Pin4.png", "pin4.png", "PIN4.png"],
-        TileType.DOT_5: ["Pin5.png", "pin5.png", "PIN5.png"],
-        TileType.DOT_6: ["Pin6.png", "pin6.png", "PIN6.png"],
-        TileType.DOT_7: ["Pin7.png", "pin7.png", "PIN7.png"],
-        TileType.DOT_8: ["Pin8.png", "pin8.png", "PIN8.png"],
-        TileType.DOT_9: ["Pin9.png", "pin9.png", "PIN9.png"],
-        TileType.WAN_1: ["Man1.png", "man1.png", "MAN1.png"],
-        TileType.WAN_2: ["Man2.png", "man2.png", "MAN2.png"],
-        TileType.WAN_3: ["Man3.png", "man3.png", "MAN3.png"],
-        TileType.WAN_4: ["Man4.png", "man4.png", "MAN4.png"],
-        TileType.WAN_5: ["Man5.png", "man5.png", "MAN5.png"],
-        TileType.WAN_6: ["Man6.png", "man6.png", "MAN6.png"],
-        TileType.WAN_7: ["Man7.png", "man7.png", "MAN7.png"],
-        TileType.WAN_8: ["Man8.png", "man8.png", "MAN8.png"],
-        TileType.WAN_9: ["Man9.png", "man9.png", "MAN9.png"],
-        TileType.EAST: ["Ton.png", "ton.png", "TON.png"],
-        TileType.SOUTH: ["Nan.png", "nan.png", "NAN.png"],
-        TileType.WEST: ["Shaa.png", "shaa.png", "SHAA.png"],
-        TileType.NORTH: ["Pei.png", "pei.png", "PEI.png"],
-        TileType.RED_DRAGON: ["Chun.png", "chun.png", "CHUN.png"],
-        TileType.GREEN_DRAGON: ["Hatsu.png", "hatsu.png", "HATSU.png"],
-        TileType.WHITE_DRAGON: ["Haku.png", "haku.png", "HAKU.png"],
-    }
+    # Вибираємо папку: спочатку 3D, якщо немає - оригінальна
+    use_3d_tiles = tiles_dir_3d.exists() and any(tiles_dir_3d.glob("*.png"))
+    
+    if use_3d_tiles:
+        tiles_dir = tiles_dir_3d
+        print(f"✓ Використовую 3D тейли з {tiles_dir}")
+        # Маппінг для нових назв файлів у папці fulltiles
+        tile_file_mapping = {
+            TileType.BAMBOO_1: ["bamboo1.png"],
+            TileType.BAMBOO_2: ["bamboo2.png"],
+            TileType.BAMBOO_3: ["bamboo3.png"],
+            TileType.BAMBOO_4: ["bamboo4.png"],
+            TileType.BAMBOO_5: ["bamboo5.png"],
+            TileType.BAMBOO_6: ["bamboo6.png"],
+            TileType.BAMBOO_7: ["bamboo7.png"],
+            TileType.BAMBOO_8: ["bamboo8.png"],
+            TileType.BAMBOO_9: ["bamboo9.png"],
+            TileType.DOT_1: ["circle1.png"],
+            TileType.DOT_2: ["circle2.png"],
+            TileType.DOT_3: ["circle3.png"],
+            TileType.DOT_4: ["circle4.png"],
+            TileType.DOT_5: ["circle5.png"],
+            TileType.DOT_6: ["circle6.png"],
+            TileType.DOT_7: ["circle7.png"],
+            TileType.DOT_8: ["circle8.png"],
+            TileType.DOT_9: ["circle9.png"],
+            TileType.WAN_1: ["pinyin1.png"],
+            TileType.WAN_2: ["pinyin2.png"],
+            TileType.WAN_3: ["pinyin3.png"],
+            TileType.WAN_4: ["pinyin4.png"],
+            TileType.WAN_5: ["pinyin5.png"],
+            TileType.WAN_6: ["pinyin6.png"],
+            TileType.WAN_7: ["pinyin7.png"],
+            TileType.WAN_8: ["pinyin8.png"],
+            TileType.WAN_9: ["pinyin9.png"],
+            TileType.EAST: ["pinyin10.png"],  # Ton
+            TileType.SOUTH: ["pinyin11.png"],  # Nan
+            TileType.WEST: ["pinyin12.png"],  # Shaa
+            TileType.NORTH: ["pinyin13.png"],  # Pei
+            TileType.RED_DRAGON: ["pinyin14.png"],  # Chun
+            TileType.GREEN_DRAGON: ["pinyin15.png"],  # Hatsu
+            TileType.WHITE_DRAGON: ["pinyin15.png", "pinyin14.png"],  # Haku (може бути відсутній, використовуємо fallback)
+            # Квіти та сезони
+            TileType.FLOWER_PLUM: ["peony.png"],
+            TileType.FLOWER_ORCHID: ["orchid.png"],
+            TileType.FLOWER_CHRYSANTHEMUM: ["chrysanthemum.png"],
+            TileType.FLOWER_BAMBOO: ["lotus.png"],
+            TileType.SEASON_SPRING: ["spring.png"],
+            TileType.SEASON_SUMMER: ["summer.png"],
+            TileType.SEASON_AUTUMN: ["fall.png"],
+            TileType.SEASON_WINTER: ["winter.png"],
+        }
+    else:
+        print(f"✓ Використовую оригінальні тейли з {tiles_dir}")
+        # Старий маппінг для оригінальних тейлів
+        tile_file_mapping = {
+            TileType.BAMBOO_1: ["Sou1.png", "sou1.png", "SOU1.png"],
+            TileType.BAMBOO_2: ["Sou2.png", "sou2.png", "SOU2.png"],
+            TileType.BAMBOO_3: ["Sou3.png", "sou3.png", "SOU3.png"],
+            TileType.BAMBOO_4: ["Sou4.png", "sou4.png", "SOU4.png"],
+            TileType.BAMBOO_5: ["Sou5.png", "sou5.png", "SOU5.png"],
+            TileType.BAMBOO_6: ["Sou6.png", "sou6.png", "SOU6.png"],
+            TileType.BAMBOO_7: ["Sou7.png", "sou7.png", "SOU7.png"],
+            TileType.BAMBOO_8: ["Sou8.png", "sou8.png", "SOU8.png"],
+            TileType.BAMBOO_9: ["Sou9.png", "sou9.png", "SOU9.png"],
+            TileType.DOT_1: ["Pin1.png", "pin1.png", "PIN1.png"],
+            TileType.DOT_2: ["Pin2.png", "pin2.png", "PIN2.png"],
+            TileType.DOT_3: ["Pin3.png", "pin3.png", "PIN3.png"],
+            TileType.DOT_4: ["Pin4.png", "pin4.png", "PIN4.png"],
+            TileType.DOT_5: ["Pin5.png", "pin5.png", "PIN5.png"],
+            TileType.DOT_6: ["Pin6.png", "pin6.png", "PIN6.png"],
+            TileType.DOT_7: ["Pin7.png", "pin7.png", "PIN7.png"],
+            TileType.DOT_8: ["Pin8.png", "pin8.png", "PIN8.png"],
+            TileType.DOT_9: ["Pin9.png", "pin9.png", "PIN9.png"],
+            TileType.WAN_1: ["Man1.png", "man1.png", "MAN1.png"],
+            TileType.WAN_2: ["Man2.png", "man2.png", "MAN2.png"],
+            TileType.WAN_3: ["Man3.png", "man3.png", "MAN3.png"],
+            TileType.WAN_4: ["Man4.png", "man4.png", "MAN4.png"],
+            TileType.WAN_5: ["Man5.png", "man5.png", "MAN5.png"],
+            TileType.WAN_6: ["Man6.png", "man6.png", "MAN6.png"],
+            TileType.WAN_7: ["Man7.png", "man7.png", "MAN7.png"],
+            TileType.WAN_8: ["Man8.png", "man8.png", "MAN8.png"],
+            TileType.WAN_9: ["Man9.png", "man9.png", "MAN9.png"],
+            TileType.EAST: ["Ton.png", "ton.png", "TON.png"],
+            TileType.SOUTH: ["Nan.png", "nan.png", "NAN.png"],
+            TileType.WEST: ["Shaa.png", "shaa.png", "SHAA.png"],
+            TileType.NORTH: ["Pei.png", "pei.png", "PEI.png"],
+            TileType.RED_DRAGON: ["Chun.png", "chun.png", "CHUN.png"],
+            TileType.GREEN_DRAGON: ["Hatsu.png", "hatsu.png", "HATSU.png"],
+            TileType.WHITE_DRAGON: ["Haku.png", "haku.png", "HAKU.png"],
+        }
     
     if tiles_dir.exists():
         existing_files = {}
@@ -885,7 +1157,9 @@ def main(page: ft.Page):
                         pass
     
     # UI елементи
-    board_container = ft.Stack([], width=1100, height=800)
+    board_container = ft.Stack([], width=1100, height=790)  # Збільшено висоту на 30 пікселів
+    # Контейнер для панелі тейлів поверх сайдбару - достатня ширина для охоплення board + sidebar + spacing
+    tile_palette_container = ft.Stack([], width=1400, height=790)
     hints_remaining = 2
     shuffle_remaining = 1
     game_records: List[dict] = []
@@ -895,6 +1169,13 @@ def main(page: ft.Page):
     best_time_label = ft.Text("Найкращий час: --:--", size=12, color="#CCCCCC")
     current_session_id: Optional[int] = None
     start_button: Optional[ft.ElevatedButton] = None
+    solitaire2_button: Optional[ft.ElevatedButton] = None
+    solitaire2_pattern_dropdown: Optional[ft.Dropdown] = None
+    duel_button: Optional[ft.ElevatedButton] = None
+    duel2_button: Optional[ft.ElevatedButton] = None
+    solitaire2_slots: List[Optional[Tile]] = [None, None, None]  # Три слоти для тейлів у Пасьянс 2 (третій заблокований)
+    selected_solitaire2_pattern: Optional[str] = None  # Вибраний патерн для solitaire2
+    selected_solitaire2_pattern: Optional[str] = None  # Вибраний патерн для solitaire2
     timer_text = ft.Text("00:00", size=24, weight=ft.FontWeight.BOLD, color=TEXT_COLOR)
     records_table = ft.DataTable(
         columns=[
@@ -1060,10 +1341,12 @@ def main(page: ft.Page):
 
     
     def play_pause_sound(sound_name: str):
-        try:
-            winsound.PlaySound(sound_name, winsound.SND_ALIAS | winsound.SND_ASYNC)
-        except RuntimeError:
-            pass
+        """Відтворює звук (тільки на Windows)"""
+        if HAS_WINSOUND and winsound:
+            try:
+                winsound.PlaySound(sound_name, winsound.SND_ALIAS | winsound.SND_ASYNC)
+            except (RuntimeError, AttributeError):
+                pass
 
     def on_timer_tick(e):
         nonlocal elapsed_seconds
@@ -1102,11 +1385,28 @@ def main(page: ft.Page):
             if auth_overlay_container in page.overlay:
                 page.overlay.remove(auth_overlay_container)
         
-        # Ініціалізуємо кнопку старту
+        # Ініціалізуємо кнопки режимів
         if start_button is None:
             initialize_start_button()
         if start_button:
             start_button.visible = True
+        if solitaire2_button is None:
+            initialize_solitaire2_button()
+        # Оновлюємо список патернів перед показом
+        if solitaire2_pattern_dropdown:
+            refresh_solitaire2_dropdown()
+        if solitaire2_button:
+            solitaire2_button.visible = True
+        if solitaire2_pattern_dropdown:
+            solitaire2_pattern_dropdown.visible = True
+        if duel_button is None:
+            initialize_duel_button()
+        if duel2_button is None:
+            initialize_duel2_button()
+        if duel_button:
+            duel_button.visible = True
+        if duel2_button:
+            duel2_button.visible = True
         
         refresh_leaderboard()
         refresh_profile_stats()
@@ -1228,14 +1528,22 @@ def main(page: ft.Page):
         if not current_profile["id"]:
             games_label.value = "Ігор: 0"
             best_time_label.value = "Найкращий час: --:--"
+            sidebar_best_date_label.value = "--"
             return
         stats = fetch_profile_stats(current_profile["id"])
         games_label.value = f"Ігор: {stats['games']}"
-        best_time_label.value = (
-            f"Найкращий час: {format_duration(stats['best'])}"
+        best_time_text = (
+            format_duration(stats['best'])
             if stats["best"] is not None
-            else "Найкращий час: --:--"
+            else "--:--"
         )
+        best_time_label.value = f"Найкращий час: {best_time_text}"
+        # Форматуємо дату кращого рекорду
+        if stats.get("best_date"):
+            date_text = format_timestamp(stats["best_date"])
+            sidebar_best_date_label.value = date_text
+        else:
+            sidebar_best_date_label.value = "--"
 
 
     def start_timer(reset: bool = True):
@@ -1420,8 +1728,10 @@ def main(page: ft.Page):
 
     def start_new_game(e=None, show_notification=True):
         nonlocal board, hints_remaining, shuffle_remaining, timer_started, elapsed_seconds, start_time
-        nonlocal current_session_id
+        nonlocal current_session_id, solitaire2_slots
+        global game_mode
         timer_control.stop()
+        # Створюємо нову дошку з поточним game_mode (який вже встановлений)
         board = Board()
         hints_remaining = 2
         shuffle_remaining = 1
@@ -1434,9 +1744,19 @@ def main(page: ft.Page):
         results_overlay.visible = False
         results_overlay.opacity = 0
         board_container.opacity = 1
-        # Приховуємо кнопку "Старт", бо гра починається
+        # Очищаємо слоти для Пасьянс 2
+        solitaire2_slots = [None, None, None]
+        # Приховуємо кнопки режимів, бо гра починається
         if start_button:
             start_button.visible = False
+        if solitaire2_button:
+            solitaire2_button.visible = False
+        if solitaire2_pattern_dropdown:
+            solitaire2_pattern_dropdown.visible = False
+        if duel_button:
+            duel_button.visible = False
+        if duel2_button:
+            duel2_button.visible = False
         update_action_ui()
         update_board()
         if show_notification:
@@ -1476,6 +1796,17 @@ def main(page: ft.Page):
         add_record(result_label, session_end_time)
         print(f"DEBUG finalize_game: Додано запис з timestamp={session_end_time}")
         refresh_leaderboard()
+        
+        # Після завершення гри показуємо кнопки режимів
+        if start_button:
+            start_button.visible = True
+        if solitaire2_button:
+            solitaire2_button.visible = True
+        if solitaire2_pattern_dropdown:
+            solitaire2_pattern_dropdown.visible = True
+        if duel_button:
+            duel_button.visible = True
+        
         detail_text = [
             ft.Text("Фініш", size=30, weight=ft.FontWeight.BOLD, color=TEXT_COLOR),
             ft.Text(f"Час: {format_duration(record_duration)}", size=20, color=TEXT_COLOR),
@@ -1746,6 +2077,829 @@ def main(page: ft.Page):
         on_click=show_support,
     )
     
+    # Overlay для діалогу підтвердження завершення гри
+    end_game_overlay: Optional[ft.Container] = None
+    
+    def close_end_game_dialog():
+        """Закриває діалог підтвердження завершення гри"""
+        nonlocal end_game_overlay
+        if end_game_overlay:
+            end_game_overlay.visible = False
+            if end_game_overlay in page.overlay:
+                page.overlay.remove(end_game_overlay)
+            page.update()
+    
+    def confirm_end_game_and_show_modes(e):
+        """Підтверджує завершення гри і показує режими"""
+        nonlocal current_session_id, board, hints_remaining, shuffle_remaining
+        print(f"DEBUG confirm_end_game_and_show_modes: Викликано")
+        close_end_game_dialog()
+        
+        # Завершуємо гру як "Перервано"
+        if board and not board.game_over and current_session_id is not None:
+            print(f"DEBUG confirm_end_game_and_show_modes: Завершую гру")
+            # Обчислюємо підказки і тасування
+            HINT_LIMIT = 2
+            SHUFFLE_LIMIT = 1
+            hints_used = HINT_LIMIT - hints_remaining
+            shuffle_used = SHUFFLE_LIMIT - shuffle_remaining
+            if hints_used < 0:
+                hints_used = 0
+            if shuffle_used < 0:
+                shuffle_used = 0
+            
+            # Завершуємо сесію
+            session_id_to_end = current_session_id
+            if session_id_to_end:
+                end_session(session_id_to_end, "Перервано", hints_used, shuffle_used)
+                current_session_id = None
+            
+            # Встановлюємо гра завершеною
+            board.game_over = True
+            stop_timer()
+        
+        # Показуємо режими
+        show_modes_page_internal()
+    
+    def show_modes_page_internal():
+        """Внутрішня функція для показу сторінки вибору режимів"""
+        nonlocal start_button, solitaire2_button, duel_button, duel2_button, board, current_session_id, pattern_constructor_mode
+        print(f"DEBUG show_modes_page_internal: Викликано")
+        pattern_constructor_mode = False  # Скидаємо режим конструктора при показі режимів
+        
+        # Ініціалізуємо кнопки, якщо вони ще не ініціалізовані
+        if start_button is None:
+            print(f"DEBUG show_modes_page_internal: Ініціалізую start_button")
+            initialize_start_button()
+        if solitaire2_button is None:
+            print(f"DEBUG show_modes_page_internal: Ініціалізую solitaire2_button")
+            initialize_solitaire2_button()
+        if duel_button is None:
+            print(f"DEBUG show_modes_page_internal: Ініціалізую duel_button")
+            initialize_duel_button()
+        if duel2_button is None:
+            print(f"DEBUG show_modes_page_internal: Ініціалізую duel2_button")
+            initialize_duel2_button()
+        
+        # Якщо гра завершена, закриваємо сесію
+        if board and board.game_over and current_session_id is not None:
+            print(f"DEBUG show_modes_page_internal: Гра завершена, закриваю сесію")
+            current_session_id = None
+        
+        # Перевіряємо, чи користувач увійшов
+        if current_profile["id"] is None:
+            print(f"DEBUG show_modes_page_internal: Користувач не увійшов")
+            page.snack_bar = ft.SnackBar(ft.Text("Спочатку увійди в систему"), open=True)
+            page.update()
+            return
+        
+        # Показуємо кнопки режимів
+        if start_button:
+            start_button.visible = True
+            print(f"DEBUG show_modes_page_internal: start_button.visible встановлено в True")
+        # Оновлюємо список патернів перед показом
+        if solitaire2_pattern_dropdown:
+            refresh_solitaire2_dropdown()
+        if solitaire2_button:
+            solitaire2_button.visible = True
+            print(f"DEBUG show_modes_page_internal: solitaire2_button.visible встановлено в True")
+        if solitaire2_pattern_dropdown:
+            solitaire2_pattern_dropdown.visible = True
+        if duel_button:
+            duel_button.visible = True
+            print(f"DEBUG show_modes_page_internal: duel_button.visible встановлено в True")
+        if duel2_button:
+            duel2_button.visible = True
+            print(f"DEBUG show_modes_page_internal: duel2_button.visible встановлено в True")
+        
+        # Оновлюємо дошку, щоб показати рамочки з кнопками
+        update_board()
+        page.update()
+        print(f"DEBUG show_modes_page_internal: update_board() та page.update() викликано")
+    
+    # Конструктор патернів
+    pattern_constructor_mode = False
+    constructor_pattern: List[List[List[bool]]] = []  # [z][y][x] -> True = місце для тейла, False = порожнє
+    constructor_current_layer = 0  # Поточний активний шар
+    constructor_cols = 20  # Як у пасьянс-1
+    constructor_rows = 10  # Як у пасьянс-1
+    
+    def initialize_pattern_constructor():
+        """Ініціалізує конструктор патернів з порожнім полем"""
+        nonlocal constructor_pattern, constructor_current_layer, sidebar_slots_area
+        # Створюємо порожній патерн з одним шаром: [z][y][x] -> False (немає тейла)
+        constructor_pattern = [
+            [[False for _ in range(constructor_cols)] for _ in range(constructor_rows)]
+        ]
+        constructor_current_layer = 0  # Починаємо з першого шару
+        # Очищаємо комірки в прозорій зоні сайдбару для конструктора
+        if sidebar_slots_area.content is None or not isinstance(sidebar_slots_area.content, ft.Stack):
+            sidebar_slots_area.content = ft.Stack([])
+        else:
+            sidebar_slots_area.content.controls.clear()
+        print(f"DEBUG initialize_pattern_constructor: Створено порожній патерн 1x{constructor_rows}x{constructor_cols}")
+    
+    def open_pattern_constructor():
+        """Відкриває конструктор патернів"""
+        nonlocal pattern_constructor_mode, board, start_button, solitaire2_button, duel_button, duel2_button
+        global game_mode
+        print(f"DEBUG open_pattern_constructor: Відкриваю конструктор")
+        
+        # Перевіряємо, чи гра активна
+        is_game_active = board and not board.game_over and current_session_id is not None
+        if is_game_active:
+            # Показуємо діалог підтвердження
+            if end_game_overlay:
+                end_game_overlay.visible = True
+                if end_game_overlay not in page.overlay:
+                    page.overlay.append(end_game_overlay)
+                page.update()
+            return
+        
+        # Приховуємо кнопки режимів
+        if start_button:
+            start_button.visible = False
+        if solitaire2_button:
+            solitaire2_button.visible = False
+        if solitaire2_pattern_dropdown:
+            solitaire2_pattern_dropdown.visible = False
+        if duel_button:
+            duel_button.visible = False
+        if duel2_button:
+            duel2_button.visible = False
+        
+        # Встановлюємо режим конструктора
+        pattern_constructor_mode = True
+        game_mode = "pattern_constructor"
+        initialize_pattern_constructor()
+        print(f"DEBUG open_pattern_constructor: pattern_constructor_mode={pattern_constructor_mode}, game_mode={game_mode}")
+        update_board()
+        page.update()
+        print(f"DEBUG open_pattern_constructor: update_board() та page.update() викликано")
+    
+    def close_pattern_constructor():
+        """Закриває конструктор патернів"""
+        nonlocal pattern_constructor_mode
+        global game_mode
+        pattern_constructor_mode = False
+        game_mode = "solitaire1"
+        update_board()
+        page.update()
+    
+    def render_pattern_constructor():
+        """Відображає конструктор патернів"""
+        nonlocal constructor_pattern
+        
+        # Очищаємо контейнер
+        board_container.controls.clear()
+        
+        # Відображаємо поле конструктора - одне велике поле з сіткою 20x10
+        # Панель тейлів більше не відображається, тому поле займає більшу частину простору
+        grid_start_x = 10
+        grid_start_y = 10  # Піднято до верхнього краю
+        
+        # Ширина sidebar = 260px, spacing = 12px
+        sidebar_width = 260
+        spacing = 12
+        available_width = board_container.width - sidebar_width - spacing - 20  # 20px відступ (без панелі тейлів)
+        available_height = board_container.height - grid_start_y - 20  # 20px відступ знизу
+        
+        # Розраховуємо розмір клітинок, щоб поміститися всі 20x10
+        # Зберігаємо пропорції реальних тейлів (50x70, тобто співвідношення 1:1.4)
+        tile_ratio = TILE_HEIGHT / TILE_WIDTH  # 70/50 = 1.4
+        
+        # Спочатку розраховуємо ширину клітинки на основі доступної ширини
+        grid_cell_size = available_width // constructor_cols  # Розмір клітинки для 20 колонок
+        
+        # Потім розраховуємо висоту з урахуванням пропорцій тейлів
+        grid_cell_height = int(grid_cell_size * tile_ratio)  # Висота зберігає пропорції тейлів
+        
+        # Перевіряємо, чи поміщаються всі рядки з такою висотою
+        total_height_needed = grid_cell_height * constructor_rows
+        if total_height_needed > available_height:
+            # Якщо не поміщається, зменшуємо висоту пропорційно
+            grid_cell_height = available_height // constructor_rows
+            # І перераховуємо ширину, щоб зберегти пропорції
+            grid_cell_size = int(grid_cell_height / tile_ratio)
+        
+        # Використовуємо всі 20 колонок і 10 рядків
+        max_cols = constructor_cols  # 20 колонок
+        max_rows = constructor_rows  # 10 рядків
+        
+        # Переконаємося, що поточний шар існує
+        if constructor_current_layer >= len(constructor_pattern):
+            # Якщо шар не існує, створюємо його
+            while len(constructor_pattern) <= constructor_current_layer:
+                constructor_pattern.append([[False for _ in range(constructor_cols)] for _ in range(constructor_rows)])
+        
+        # Спочатку малюємо поточний активний шар (клітинки з можливістю кліку)
+        z = constructor_current_layer
+        for y in range(max_rows):
+            for x in range(max_cols):
+                cell_x = grid_start_x + x * grid_cell_size
+                cell_y = grid_start_y + y * grid_cell_height
+                
+                # Перевіряємо, чи позначено місце для тейла
+                is_marked = False
+                if z < len(constructor_pattern) and y < len(constructor_pattern[z]) and x < len(constructor_pattern[z][y]):
+                    is_marked = constructor_pattern[z][y][x]
+                
+                # Створюємо клітинку сітки (завжди видима для орієнтації)
+                cell_bgcolor = "#3A3A3A" if (x + y) % 2 == 0 else "#333333"
+                if is_marked:
+                    cell_bgcolor = "#5A5A5A"  # Місце позначено для тейла
+                
+                cell = ft.Container(
+                    width=grid_cell_size - 1,
+                    height=grid_cell_height - 1,
+                    left=cell_x,
+                    top=cell_y,
+                    bgcolor=cell_bgcolor,
+                    border=ft.border.all(1, "#555555"),
+                    on_click=lambda e, z_coord=z, y_coord=y, x_coord=x: constructor_cell_clicked(z_coord, y_coord, x_coord),
+                )
+                board_container.controls.append(cell)
+                
+                # Якщо місце позначено, показуємо індикатор (невеликий маркер)
+                if is_marked:
+                    marker = ft.Container(
+                        width=20,
+                        height=20,
+                        left=cell_x + (grid_cell_size - 20) // 2,
+                        top=cell_y + (grid_cell_height - 20) // 2,
+                        bgcolor="#4CAF50",  # Зелений маркер
+                        border_radius=10,
+                        border=ft.border.all(2, "#FFFFFF"),
+                    )
+                    board_container.controls.append(marker)
+        
+        # Тепер малюємо попередні шари (z < constructor_current_layer) тільки контуром ПОВЕРХ поточного
+        # Це гарантує, що контури будуть видимі, але не блокуватимуть кліки (немає on_click)
+        for z in range(constructor_current_layer):
+            if z >= len(constructor_pattern):
+                continue
+                
+            for y in range(max_rows):
+                for x in range(max_cols):
+                    cell_x = grid_start_x + x * grid_cell_size
+                    cell_y = grid_start_y + y * grid_cell_height
+                    
+                    # Перевіряємо, чи позначено місце для тейла
+                    is_marked = False
+                    if y < len(constructor_pattern[z]) and x < len(constructor_pattern[z][y]):
+                        is_marked = constructor_pattern[z][y][x]
+                    
+                    # Показуємо тільки позначені місця попередніх шарів тільки контуром (без заливки)
+                    # Малюємо контури ПОВЕРХ клітинок поточного шару, але тільки по краях, щоб не блокувати кліки в центрі
+                    if is_marked:
+                        # Контур клітинки з позначкою - тільки по краях, щоб не перекривати центр
+                        # Робимо контур меншим, щоб залишити центр вільною для кліків
+                        # Верхній край
+                        top_border = ft.Container(
+                            width=grid_cell_size - 8,
+                            height=3,
+                            left=cell_x + 4,
+                            top=cell_y + 1,
+                            bgcolor="#AAAAAA",  # Світло-сірий колір для помітності
+                        )
+                        board_container.controls.append(top_border)
+                        
+                        # Нижній край
+                        bottom_border = ft.Container(
+                            width=grid_cell_size - 8,
+                            height=3,
+                            left=cell_x + 4,
+                            top=cell_y + grid_cell_height - 4,
+                            bgcolor="#AAAAAA",
+                        )
+                        board_container.controls.append(bottom_border)
+                        
+                        # Лівий край
+                        left_border = ft.Container(
+                            width=3,
+                            height=grid_cell_height - 8,
+                            left=cell_x + 1,
+                            top=cell_y + 4,
+                            bgcolor="#AAAAAA",
+                        )
+                        board_container.controls.append(left_border)
+                        
+                        # Правий край
+                        right_border = ft.Container(
+                            width=3,
+                            height=grid_cell_height - 8,
+                            left=cell_x + grid_cell_size - 4,
+                            top=cell_y + 4,
+                            bgcolor="#AAAAAA",
+                        )
+                        board_container.controls.append(right_border)
+                        
+                        # Контур маркера - маленький кружечок по краю, щоб не перекривати центр
+                        marker = ft.Container(
+                            width=12,
+                            height=12,
+                            left=cell_x + (grid_cell_size - 12) // 2,
+                            top=cell_y + 2,  # Розміщуємо зверху, щоб не перекривати центр
+                            bgcolor=None,  # Без заливки
+                            border_radius=6,
+                            border=ft.border.all(2, "#AAAAAA"),  # Тонка світло-сіра рамка
+                        )
+                        board_container.controls.append(marker)
+        
+        # Панель керування шарами (червоне поле знизу)
+        render_constructor_controls()
+    
+    def render_constructor_controls():
+        """Відображає панель керування конструктором (кнопки для шарів)"""
+        nonlocal constructor_current_layer, constructor_pattern
+        
+        # Розміщуємо панель одразу під сіткою
+        # Розраховуємо позицію на основі розмірів сітки
+        grid_start_x = 10
+        grid_start_y = 10
+        sidebar_width = 260
+        spacing = 12
+        available_width = board_container.width - sidebar_width - spacing - 20
+        available_height = board_container.height - grid_start_y - 20
+        tile_ratio = TILE_HEIGHT / TILE_WIDTH
+        grid_cell_size = available_width // constructor_cols
+        grid_cell_height = int(grid_cell_size * tile_ratio)
+        if grid_cell_height * constructor_rows > available_height:
+            grid_cell_height = available_height // constructor_rows
+            grid_cell_size = int(grid_cell_height / tile_ratio)
+        
+        # Висота сітки
+        grid_height = grid_cell_height * constructor_rows
+        controls_panel_y = grid_start_y + grid_height + 10  # 10px відступ під сіткою
+        controls_panel_x = 10
+        
+        # Заголовок з інформацією про поточний шар
+        layer_info = ft.Container(
+            content=ft.Text(
+                f"Шар {constructor_current_layer + 1} з {len(constructor_pattern)}",
+                size=14,
+                weight=ft.FontWeight.BOLD,
+                color="#FFFFFF",
+            ),
+            left=controls_panel_x,
+            top=controls_panel_y,
+        )
+        board_container.controls.append(layer_info)
+        
+        # Кнопка "+1 шар"
+        def add_layer(e):
+            nonlocal constructor_pattern, constructor_current_layer
+            # Додаємо новий шар
+            new_layer = [[False for _ in range(constructor_cols)] for _ in range(constructor_rows)]
+            constructor_pattern.append(new_layer)
+            # Перемикаємося на новий шар
+            constructor_current_layer = len(constructor_pattern) - 1
+            print(f"DEBUG add_layer: Додано новий шар. Всього шарів: {len(constructor_pattern)}, поточний: {constructor_current_layer}")
+            update_board()
+            page.update()
+        
+        add_layer_button = ft.ElevatedButton(
+            "+1 шар",
+            width=100,
+            height=40,
+            bgcolor="#4CAF50",
+            color="#FFFFFF",
+            on_click=add_layer,
+        )
+        board_container.controls.append(
+            ft.Container(
+                content=add_layer_button,
+                left=controls_panel_x + 200,
+                top=controls_panel_y,
+            )
+        )
+        
+        # Кнопка "Видалити шар" (тільки якщо є більше одного шару)
+        def delete_layer(e):
+            nonlocal constructor_pattern, constructor_current_layer
+            if len(constructor_pattern) > 1:
+                # Видаляємо поточний шар
+                del constructor_pattern[constructor_current_layer]
+                # Якщо видалили останній шар, переходимо на попередній
+                if constructor_current_layer >= len(constructor_pattern):
+                    constructor_current_layer = len(constructor_pattern) - 1
+                update_board()
+                page.update()
+            else:
+                # Показуємо повідомлення, що не можна видалити останній шар
+                page.snack_bar = ft.SnackBar(ft.Text("Не можна видалити останній шар"), open=True)
+                page.update()
+        
+        delete_layer_button = ft.ElevatedButton(
+            "Видалити шар",
+            width=120,
+            height=40,
+            bgcolor="#F44336" if len(constructor_pattern) > 1 else "#999999",
+            color="#FFFFFF",
+            on_click=delete_layer,
+            disabled=len(constructor_pattern) <= 1,
+        )
+        board_container.controls.append(
+            ft.Container(
+                content=delete_layer_button,
+                left=controls_panel_x + 310,
+                top=controls_panel_y,
+            )
+        )
+        
+        # Кнопки для перемикання між шарами
+        for layer_idx in range(len(constructor_pattern)):
+            def switch_to_layer(e, layer=layer_idx):
+                nonlocal constructor_current_layer
+                constructor_current_layer = layer
+                update_board()
+                page.update()
+            
+            layer_button = ft.ElevatedButton(
+                f"Шар {layer_idx + 1}",
+                width=80,
+                height=40,
+                bgcolor="#2196F3" if layer_idx == constructor_current_layer else "#666666",
+                color="#FFFFFF",
+                on_click=switch_to_layer,
+            )
+            board_container.controls.append(
+                ft.Container(
+                    content=layer_button,
+                    left=controls_panel_x + 440 + layer_idx * 90,
+                    top=controls_panel_y,
+                )
+            )
+        
+        # Поле для назви патерну та кнопка "Зберегти"
+        pattern_name_field = ft.TextField(
+            label="Назва патерну",
+            width=200,
+            height=40,
+            hint_text="Введіть назву",
+        )
+        board_container.controls.append(
+            ft.Container(
+                content=pattern_name_field,
+                left=controls_panel_x,
+                top=controls_panel_y + 50,
+            )
+        )
+        
+        def save_pattern(e):
+            nonlocal constructor_pattern
+            pattern_name = pattern_name_field.value.strip()
+            if not pattern_name:
+                page.snack_bar = ft.SnackBar(ft.Text("Введіть назву патерну"), open=True)
+                page.update()
+                return
+            
+            # Підраховуємо кількість позначених місць
+            total_marked = 0
+            for layer in constructor_pattern:
+                for row in layer:
+                    total_marked += sum(1 for cell in row if cell)
+            
+            if total_marked == 0:
+                page.snack_bar = ft.SnackBar(ft.Text("Патерн порожній. Позначте хоча б одне місце для тейла"), open=True)
+                page.update()
+                return
+            
+            # Зберігаємо патерн
+            pattern_data = {
+                "name": pattern_name,
+                "cols": constructor_cols,
+                "rows": constructor_rows,
+                "layers": constructor_pattern,
+                "created_at": datetime.now().isoformat(),
+            }
+            
+            # Створюємо папку для патернів, якщо її немає
+            patterns_dir = Path("patterns")
+            patterns_dir.mkdir(exist_ok=True)
+            
+            # Зберігаємо в JSON файл
+            pattern_file = patterns_dir / f"{pattern_name}.json"
+            with open(pattern_file, "w", encoding="utf-8") as f:
+                json.dump(pattern_data, f, indent=2, ensure_ascii=False)
+            
+            page.snack_bar = ft.SnackBar(ft.Text(f"Патерн '{pattern_name}' збережено! Позначено місць: {total_marked}"), open=True)
+            print(f"DEBUG save_pattern: Збережено патерн '{pattern_name}' з {total_marked} позначеними місцями")
+            # Оновлюємо випадаюче меню, щоб показати новий патерн
+            refresh_pattern_dropdown()
+            # Оновлюємо меню для solitaire2
+            refresh_solitaire2_dropdown()
+            # Оновлюємо інтерфейс
+            update_board()
+            page.update()
+        
+        save_button = ft.ElevatedButton(
+            "Зберегти патерн",
+            width=150,
+            height=40,
+            bgcolor="#FF9800",
+            color="#FFFFFF",
+            on_click=save_pattern,
+        )
+        board_container.controls.append(
+            ft.Container(
+                content=save_button,
+                left=controls_panel_x + 210,
+                top=controls_panel_y + 50,
+            )
+        )
+        
+        # Випадаюче меню збережених патернів
+        # Спочатку завантажуємо список патернів
+        patterns_dir = Path("patterns")
+        pattern_files = []
+        pattern_names = []
+        if patterns_dir.exists():
+            pattern_files = sorted(patterns_dir.glob("*.json"))
+            for pattern_file in pattern_files:
+                try:
+                    with open(pattern_file, "r", encoding="utf-8") as f:
+                        pattern_data = json.load(f)
+                    pattern_names.append(pattern_data.get("name", pattern_file.stem))
+                except:
+                    pattern_names.append(pattern_file.stem)
+        
+        # Створюємо випадаюче меню
+        pattern_dropdown = ft.Dropdown(
+            label="Збережені патерни",
+            width=200,
+            options=[ft.dropdown.Option(name) for name in pattern_names] if pattern_names else [],
+            value=None,
+        )
+        
+        # Функція для оновлення списку патернів
+        def refresh_pattern_dropdown():
+            """Оновлює список патернів у випадаючому меню"""
+            patterns_dir = Path("patterns")
+            pattern_files_list = []
+            pattern_names_list = []
+            if patterns_dir.exists():
+                pattern_files_list = sorted(patterns_dir.glob("*.json"))
+                for pattern_file in pattern_files_list:
+                    try:
+                        with open(pattern_file, "r", encoding="utf-8") as f:
+                            pattern_data = json.load(f)
+                        pattern_names_list.append(pattern_data.get("name", pattern_file.stem))
+                    except:
+                        pattern_names_list.append(pattern_file.stem)
+            
+            pattern_dropdown.options = [ft.dropdown.Option(name) for name in pattern_names_list] if pattern_names_list else []
+            pattern_dropdown.value = None
+            return pattern_files_list, pattern_names_list
+        
+        # Функція для завантаження патерну
+        def load_pattern_for_edit(e):
+            nonlocal constructor_pattern, constructor_current_layer
+            selected_name = pattern_dropdown.value
+            if not selected_name:
+                page.snack_bar = ft.SnackBar(ft.Text("Виберіть патерн зі списку"), open=True)
+                page.update()
+                return
+            
+            # Оновлюємо список файлів
+            pattern_files_list, _ = refresh_pattern_dropdown()
+            
+            # Знаходимо файл патерну
+            pattern_file = None
+            for pf in pattern_files_list:
+                try:
+                    with open(pf, "r", encoding="utf-8") as f:
+                        pattern_data = json.load(f)
+                    if pattern_data.get("name", pf.stem) == selected_name:
+                        pattern_file = pf
+                        break
+                except:
+                    if pf.stem == selected_name:
+                        pattern_file = pf
+                        break
+            
+            if not pattern_file:
+                page.snack_bar = ft.SnackBar(ft.Text("Патерн не знайдено"), open=True)
+                page.update()
+                return
+            
+            try:
+                with open(pattern_file, "r", encoding="utf-8") as f:
+                    pattern_data = json.load(f)
+                
+                # Завантажуємо патерн
+                if "layers" in pattern_data:
+                    constructor_pattern = []
+                    for layer in pattern_data["layers"]:
+                        converted_layer = []
+                        for row in layer:
+                            converted_row = [bool(cell) for cell in row]
+                            converted_layer.append(converted_row)
+                        constructor_pattern.append(converted_layer)
+                    
+                    constructor_current_layer = 0
+                    
+                    # Заповнюємо поле назви
+                    pattern_name_field.value = pattern_data.get("name", "")
+                    
+                    page.snack_bar = ft.SnackBar(ft.Text(f"Патерн '{pattern_data.get('name', '')}' завантажено для редагування"), open=True)
+                    update_board()
+                    page.update()
+                else:
+                    page.snack_bar = ft.SnackBar(ft.Text("Помилка: некоректний формат патерну"), open=True)
+                    page.update()
+            except Exception as ex:
+                page.snack_bar = ft.SnackBar(ft.Text(f"Помилка завантаження: {ex}"), open=True)
+                page.update()
+        
+        # Кнопка "Завантажити" для вибраного патерну
+        load_button = ft.ElevatedButton(
+            "Завантажити",
+            width=120,
+            height=40,
+            bgcolor="#2196F3",
+            color="#FFFFFF",
+            on_click=load_pattern_for_edit,
+        )
+        
+        # Функція для видалення патерну
+        def delete_pattern(e):
+            selected_name = pattern_dropdown.value
+            if not selected_name:
+                page.snack_bar = ft.SnackBar(ft.Text("Виберіть патерн для видалення"), open=True)
+                page.update()
+                return
+            
+            # Оновлюємо список файлів
+            pattern_files_list, _ = refresh_pattern_dropdown()
+            
+            # Знаходимо файл патерну
+            pattern_file = None
+            for pf in pattern_files_list:
+                try:
+                    with open(pf, "r", encoding="utf-8") as f:
+                        pattern_data = json.load(f)
+                    if pattern_data.get("name", pf.stem) == selected_name:
+                        pattern_file = pf
+                        break
+                except:
+                    if pf.stem == selected_name:
+                        pattern_file = pf
+                        break
+            
+            if not pattern_file:
+                page.snack_bar = ft.SnackBar(ft.Text("Патерн не знайдено"), open=True)
+                page.update()
+                return
+            
+            try:
+                pattern_file.unlink()
+                page.snack_bar = ft.SnackBar(ft.Text(f"Патерн '{selected_name}' видалено"), open=True)
+                # Оновлюємо список у випадаючому меню
+                refresh_pattern_dropdown()
+                update_board()
+                page.update()
+            except Exception as ex:
+                page.snack_bar = ft.SnackBar(ft.Text(f"Помилка видалення: {ex}"), open=True)
+                page.update()
+        
+        # Кнопка "Видалити"
+        delete_button = ft.ElevatedButton(
+            "Видалити",
+            width=120,
+            height=40,
+            bgcolor="#F44336",
+            color="#FFFFFF",
+            on_click=delete_pattern,
+        )
+        
+        # Розміщуємо випадаюче меню та кнопки
+        board_container.controls.append(
+            ft.Container(
+                content=pattern_dropdown,
+                left=controls_panel_x,
+                top=controls_panel_y + 100,
+            )
+        )
+        board_container.controls.append(
+            ft.Container(
+                content=load_button,
+                left=controls_panel_x + 210,
+                top=controls_panel_y + 100,
+            )
+        )
+        board_container.controls.append(
+            ft.Container(
+                content=delete_button,
+                left=controls_panel_x + 340,
+                top=controls_panel_y + 100,
+            )
+        )
+    
+    def constructor_cell_clicked(z: int, y: int, x: int):
+        """Обробляє клік по клітинці конструктора - перемикає позначку місця для тейла"""
+        nonlocal constructor_pattern, constructor_current_layer
+        
+        # Використовуємо поточний активний шар
+        current_z = constructor_current_layer
+        
+        # Переконаємося, що шар існує
+        if current_z >= len(constructor_pattern):
+            while len(constructor_pattern) <= current_z:
+                constructor_pattern.append([[False for _ in range(constructor_cols)] for _ in range(constructor_rows)])
+        
+        # Перемикаємо позначку: True -> False, False -> True
+        constructor_pattern[current_z][y][x] = not constructor_pattern[current_z][y][x]
+        print(f"DEBUG constructor_cell_clicked: {'Позначено' if constructor_pattern[current_z][y][x] else 'Знято позначку'} місце для тейла на ({x},{y},{current_z})")
+        
+        update_board()
+        page.update()
+    
+    def render_tile_palette():
+        """Панель заготовок тейлів більше не використовується - просто очищаємо контейнер"""
+        nonlocal tile_palette_container
+        # Очищаємо контейнер панелі тейлів (більше не потрібна)
+        tile_palette_container.controls.clear()
+    
+    def save_pattern():
+        """Зберігає патерн під назвою"""
+        nonlocal constructor_pattern
+        # TODO: Додати діалог введення назви та збереження
+        print(f"DEBUG save_pattern: Зберігаю патерн (TODO: діалог введення назви)")
+        page.snack_bar = ft.SnackBar(ft.Text("Функція збереження в розробці"), open=True)
+        page.update()
+    
+    def show_modes_page(e):
+        """Показує сторінку вибору режимів та ігор"""
+        nonlocal start_button, duel_button, duel2_button, board, current_session_id, end_game_overlay
+        print(f"DEBUG show_modes_page: Викликано")
+        print(f"DEBUG show_modes_page: current_profile['id']={current_profile['id']}")
+        print(f"DEBUG show_modes_page: board={board}")
+        print(f"DEBUG show_modes_page: board.game_over={board.game_over if board else 'None'}")
+        print(f"DEBUG show_modes_page: current_session_id={current_session_id}")
+        
+        # Перевіряємо, чи гра активна (не завершена і є активна сесія)
+        is_game_active = board and not board.game_over and current_session_id is not None
+        print(f"DEBUG show_modes_page: is_game_active={is_game_active}")
+        
+        if is_game_active:
+            print(f"DEBUG show_modes_page: Гра активна, показую діалог підтвердження")
+            nonlocal end_game_overlay
+            # Створюємо overlay, якщо він ще не створений
+            if end_game_overlay is None:
+                print(f"DEBUG show_modes_page: Створюю end_game_overlay")
+                end_game_overlay = ft.Container(
+                    expand=True,
+                    bgcolor="#000000DD",
+                    alignment=ft.alignment.center,
+                    content=ft.Container(
+                        width=400,
+                        height=200,
+                        padding=20,
+                        bgcolor="#1E1E1E",
+                        border_radius=10,
+                        content=ft.Column(
+                            [
+                                ft.Text("Завершити гру?", size=18, weight=ft.FontWeight.BOLD, color="#FFFFFF"),
+                                ft.Divider(height=10),
+                                ft.Text("Чи дійсно завершити поточну гру?", size=14, color="#FFFFFF"),
+                                ft.Container(height=20),
+                                ft.Row(
+                                    [
+                                        ft.ElevatedButton("Так", on_click=confirm_end_game_and_show_modes, width=100, bgcolor="#4CAF50"),
+                                        ft.ElevatedButton("Ні", on_click=lambda e: close_end_game_dialog(), width=100, bgcolor="#666666"),
+                                    ],
+                                    alignment=ft.MainAxisAlignment.END,
+                                    spacing=10,
+                                ),
+                            ],
+                            spacing=8,
+                            tight=True,
+                        ),
+                    ),
+                    visible=False,
+                )
+            
+            if end_game_overlay not in page.overlay:
+                page.overlay.append(end_game_overlay)
+            end_game_overlay.visible = True
+            print(f"DEBUG show_modes_page: end_game_overlay.visible встановлено в True, викликаю page.update()")
+            page.update()
+            print(f"DEBUG show_modes_page: page.update() викликано")
+            return
+        
+        # Якщо гра не активна, просто показуємо режими
+        print(f"DEBUG show_modes_page: Гра не активна, показую режими безпосередньо")
+        show_modes_page_internal()
+    
+    modes_button = ft.ElevatedButton(
+        "Режими",
+        width=180,
+        bgcolor="#4CAF50",
+        color="#FFFFFF",
+        on_click=show_modes_page,
+    )
+    
     # Розділяємо sidebar на 3 частини
     # Частина 1: Інформація про користувача та кнопки
     sidebar_part1 = ft.Container(
@@ -1762,24 +2916,21 @@ def main(page: ft.Page):
                 ft.Text("Таймер", size=16, weight=ft.FontWeight.BOLD, color=TEXT_COLOR),
                 timer_text,
             ],
-            spacing=12,
+            spacing=8,  # Зменшено spacing з 12 до 8
             tight=True,
         ),
-        padding=ft.padding.all(12),
+        padding=ft.padding.symmetric(horizontal=12, vertical=8),  # Зменшено vertical padding
     )
     
-    # Частина 2: Таблиця рекордів у своєму фреймі
+    # Частина 2: Дата кращого рекорду
+    # Лейбл для дати кращого рекорду в sidebar_part2
+    sidebar_best_date_label = ft.Text("--", size=14, color=TEXT_COLOR)
+    
     sidebar_part2 = ft.Container(
         content=ft.Column(
             [
-                ft.Text("Рекорди", size=16, weight=ft.FontWeight.BOLD, color=TEXT_COLOR),
-                ft.Container(
-                    content=records_table,
-                    height=200,  # Фіксована висота для таблиці
-                    border=None,  # Прибрано border з контейнера
-                    padding=ft.padding.all(0),  # Зменшено padding
-                    clip_behavior=ft.ClipBehavior.HARD_EDGE,  # Обрізаємо вміст, якщо не поміщається
-                ),
+                ft.Text("Кращий час", size=16, weight=ft.FontWeight.BOLD, color=TEXT_COLOR),
+                sidebar_best_date_label,
             ],
             spacing=8,
             tight=True,
@@ -1791,9 +2942,16 @@ def main(page: ft.Page):
     # Divider для таблиці рекордів
     sidebar_part2_divider = ft.Divider(height=1, color="#2b2b2b", visible=False)
     
-    # Частина 3: Кнопка Support внизу (завжди видима)
+    # Частина 3: Кнопки Support та Режими внизу (завжди видимі)
     sidebar_part3 = ft.Container(
-        content=support_button,
+        content=ft.Column(
+            [
+                modes_button,
+                support_button,
+            ],
+            spacing=8,
+            horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+        ),
         padding=ft.padding.all(12),
         alignment=ft.alignment.center,
     )
@@ -1810,9 +2968,10 @@ def main(page: ft.Page):
             sidebar_part2_divider.visible = False
         page.update()
     
-    sidebar = ft.Container(
-        width=200,  # Зменшено з 220 до 200
-        height=780,
+    # Створюємо прозору частину для комірок (50px зліва) та видиму частину сайдбару (200px справа)
+    sidebar_visible = ft.Container(
+        width=200,  # Видима частина сайдбару
+        height=730,
         bgcolor=UI_PANEL_COLOR,
         border=ft.border.all(1, "#2b2b2b"),
         border_radius=10,
@@ -1825,43 +2984,81 @@ def main(page: ft.Page):
                 sidebar_part3,  # Нижня частина - кнопка Support завжди видима
             ],
             spacing=0,
-            expand=True,  # Дозволяє Column займати весь доступний простір
+            expand=False,  # Прибрано expand, щоб не було пустого поля
         ),
     )
-    content_row = ft.Row(
-        [
-            ft.Container(content=board_container, expand=True, alignment=ft.alignment.top_left),
-            sidebar,
-        ],
-        spacing=12,
-        expand=True,
-        alignment=ft.MainAxisAlignment.START,
-        vertical_alignment=ft.CrossAxisAlignment.START,
+    
+    # Прозора частина для комірок (60px зліва)
+    sidebar_slots_area = ft.Container(
+        width=60,  # Збільшено з 50 до 60 пікселів
+        height=730,
+        bgcolor=None,  # Прозорий фон
+        border=None,
+        content=ft.Stack([]),  # Ініціалізуємо Stack для комірок
+    )
+    
+    # Об'єднуємо прозору частину та видиму частину сайдбару
+    sidebar = ft.Container(
+        width=260,  # Збільшено з 250 до 260 (60 прозора + 200 видима)
+        height=730,
+        margin=ft.margin.only(top=10),  # Глобальний відступ зверху, як у тейлів
+        content=ft.Row(
+            [
+                sidebar_slots_area,  # Прозора частина для комірок (60px)
+                sidebar_visible,  # Видима частина сайдбару (200px)
+            ],
+            spacing=0,
+            expand=False,
+        ),
+    )
+    content_row = ft.Container(
+        content=ft.Row(
+            [
+                ft.Container(content=board_container, width=1100, height=790, alignment=ft.alignment.top_left),
+                sidebar,
+            ],
+            spacing=12,
+            expand=False,  # Прибрано expand, щоб не було пустого поля
+            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,  # Розтягуємо, щоб сайдбар був справа
+            vertical_alignment=ft.CrossAxisAlignment.START,
+        ),
+        margin=ft.margin.only(left=10, right=10),  # Глобальні відступи зліва і справа (10 пікселів)
     )
     # Створюємо головний контейнер з Stack для overlay
     main_stack = ft.Stack(
         [
             content_row,
+            tile_palette_container,  # Панель тейлів поверх сайдбару
         ],
-        expand=True,
+        expand=False,  # Прибрано expand, щоб не було пустого поля
     )
     print(f"DEBUG: main_stack створено, controls count={len(main_stack.controls)}")
     update_action_ui()
     def create_tile_container(tile: Tile) -> ft.Container:
         """Створює контейнер для плитки"""
+        global game_mode
         board_start_x = 10
+        # Глобальний відступ зверху для всіх режимів
         board_start_y = 10
 
-        screen_x = board_start_x + tile.x * TILE_SPACING_X
-        screen_y = board_start_y + tile.y * TILE_SPACING_Y
+        # Для Пасьянс 2 додаємо зміщення залежно від рівня (z)
+        # Тейли на вищих рівнях зміщуються вправо-вниз для 3D ефекту
+        # Збільшуємо зміщення для кращої видимості вищих рівнів
+        # Зміщення для шарів: трохи вгору і вправо для вищих рівнів
+        z_offset_x = tile.z * 5 if game_mode == "solitaire2" else 0  # Зміщення вправо для вищих рівнів (5px на шар)
+        z_offset_y = -tile.z * 5 if game_mode == "solitaire2" else 0  # Зміщення вгору для вищих рівнів (5px на шар)
+        
+        screen_x = board_start_x + tile.x * TILE_SPACING_X + z_offset_x
+        screen_y = board_start_y + tile.y * TILE_SPACING_Y + z_offset_y
 
         if tile.highlighted:
             border_color = HINT_COLOR
             border_width = 4
             tile_bgcolor = "#FFF9D5"
         else:
-            border_color = SELECTED_COLOR if tile.selected else AVAILABLE_COLOR
-            border_width = 4 if tile.selected else 2
+            # Прибираємо обводку для звичайних тейлів, залишаємо тільки для вибраних
+            border_color = SELECTED_COLOR if tile.selected else None
+            border_width = 1 if tile.selected else 0  # Тонка обводка 1 піксель для вибраних тейлів
             tile_bgcolor = TILE_COLOR
 
         if tile.tile_type in tile_images:
@@ -1891,9 +3088,15 @@ def main(page: ft.Page):
             top=screen_y,
             width=TILE_WIDTH,
             height=TILE_HEIGHT,
-            border=ft.border.all(border_width, border_color),
+            border=ft.border.all(border_width, border_color) if border_color else None,
             border_radius=5,
-            bgcolor=tile_bgcolor,
+            # Додаємо тінь для 3D ефекту (без білого фону)
+            shadow=ft.BoxShadow(
+                spread_radius=1,
+                blur_radius=8,
+                color="#00000066",  # Напівпрозора чорна тінь
+                offset=ft.Offset(2, 3),  # Зсув тіні вправо-вниз
+            ),
             opacity=1.0,
             on_click=lambda e, t=tile: tile_clicked(t),
         )
@@ -1903,6 +3106,7 @@ def main(page: ft.Page):
     
     def tile_clicked(tile: Tile):
         """Обробник кліку по плитці"""
+        global game_mode
         # Перевіряємо, чи гра почалася
         if start_button and start_button.visible:
             return
@@ -1916,26 +3120,203 @@ def main(page: ft.Page):
         nonlocal timer_started
         if not timer_started and not board.game_over:
             start_timer(reset=True)
-        board.clear_highlights()
+        # Для Пасьянс 1 не очищаємо highlights, бо вони встановлюються в click_tile
+        # Для інших режимів очищаємо
+        if game_mode != "solitaire1":
+            board.clear_highlights()
         board.click_tile(tile)
         update_board()
     
     start_button: Optional[ft.ElevatedButton]
+    solitaire2_button: Optional[ft.ElevatedButton]
+    duel_button: Optional[ft.ElevatedButton]
 
     def initialize_start_button():
         nonlocal start_button
         start_button = ft.ElevatedButton(
-            "Однокористувацький режим",
+            "Пасьянс 1",
             width=220,
             height=40,
             on_click=lambda e: load_tiles(),
         )
         # Кнопка не видима до входу користувача
         start_button.visible = False
+    
+    def refresh_solitaire2_dropdown():
+        """Оновлює список патернів у випадаючому меню для solitaire2"""
+        nonlocal solitaire2_pattern_dropdown, selected_solitaire2_pattern
+        if not solitaire2_pattern_dropdown:
+            return
+        
+        patterns_dir = Path("patterns")
+        pattern_names = []
+        if patterns_dir.exists():
+            pattern_files = sorted(patterns_dir.glob("*.json"))
+            for pattern_file in pattern_files:
+                try:
+                    with open(pattern_file, "r", encoding="utf-8") as f:
+                        pattern_data = json.load(f)
+                    pattern_names.append(pattern_data.get("name", pattern_file.stem))
+                except:
+                    pattern_names.append(pattern_file.stem)
+        
+        solitaire2_pattern_dropdown.options = [ft.dropdown.Option(name) for name in pattern_names] if pattern_names else []
+        # Зберігаємо вибране значення, якщо воно все ще існує
+        if selected_solitaire2_pattern and selected_solitaire2_pattern in pattern_names:
+            solitaire2_pattern_dropdown.value = selected_solitaire2_pattern
+        else:
+            solitaire2_pattern_dropdown.value = None
+            selected_solitaire2_pattern = None
+    
+    def initialize_solitaire2_button():
+        nonlocal solitaire2_button, solitaire2_pattern_dropdown, selected_solitaire2_pattern
+        
+        # Завантажуємо список патернів
+        patterns_dir = Path("patterns")
+        pattern_names = []
+        if patterns_dir.exists():
+            pattern_files = sorted(patterns_dir.glob("*.json"))
+            for pattern_file in pattern_files:
+                try:
+                    with open(pattern_file, "r", encoding="utf-8") as f:
+                        pattern_data = json.load(f)
+                    pattern_names.append(pattern_data.get("name", pattern_file.stem))
+                except:
+                    pattern_names.append(pattern_file.stem)
+        
+        # Створюємо випадаюче меню для вибору патерну
+        solitaire2_pattern_dropdown = ft.Dropdown(
+            label="Виберіть патерн",
+            width=200,
+            options=[ft.dropdown.Option(name) for name in pattern_names] if pattern_names else [],
+            value=None,
+        )
+        
+        # Обробник зміни вибору патерну
+        def on_pattern_selected(e):
+            nonlocal selected_solitaire2_pattern
+            selected_solitaire2_pattern = solitaire2_pattern_dropdown.value
+        
+        solitaire2_pattern_dropdown.on_change = on_pattern_selected
+        
+        solitaire2_button = ft.ElevatedButton(
+            "Пасьянс 2",
+            width=220,
+            height=40,
+            on_click=lambda e: start_solitaire2_mode(selected_solitaire2_pattern),
+        )
+        # Кнопка не видима до входу користувача
+        solitaire2_button.visible = False
+        if solitaire2_pattern_dropdown:
+            solitaire2_pattern_dropdown.visible = False
+    
+    def start_solitaire2_mode(pattern_name: Optional[str] = None):
+        """Запускає режим Пасьянс 2 з вибраним патерном"""
+        nonlocal solitaire2_button, solitaire2_pattern_dropdown, current_session_id, solitaire2_slots, board, pattern_constructor_mode
+        nonlocal hints_remaining, shuffle_remaining, timer_started, elapsed_seconds, start_time, selected_solitaire2_pattern
+        global game_mode
+        game_mode = "solitaire2"
+        pattern_constructor_mode = False  # Скидаємо режим конструктора
+        solitaire2_slots = [None, None, None]  # Очищаємо слоти
+        
+        # Використовуємо вибраний патерн з меню, якщо не вказано явно
+        if not pattern_name and selected_solitaire2_pattern:
+            pattern_name = selected_solitaire2_pattern
+        
+        # Приховуємо кнопки режимів
+        if solitaire2_button:
+            solitaire2_button.visible = False
+        if solitaire2_pattern_dropdown:
+            solitaire2_pattern_dropdown.visible = False
+        if start_button:
+            start_button.visible = False
+        if duel_button:
+            duel_button.visible = False
+        if duel2_button:
+            duel2_button.visible = False
+        
+        # Створюємо нову дошку з правильним game_mode
+        timer_control.stop()
+        board = Board()  # Створюємо нову дошку з game_mode="solitaire2"
+        # Встановлюємо вибраний патерн для генерації
+        if pattern_name:
+            board.selected_pattern_name = pattern_name
+        hints_remaining = 2
+        shuffle_remaining = 1
+        timer_started = False
+        elapsed_seconds = 0
+        start_time = 0.0
+        timer_text.value = format_duration(0)
+        pause_overlay.visible = False
+        pause_overlay.opacity = 0
+        results_overlay.visible = False
+        results_overlay.opacity = 0
+        board_container.opacity = 1
+        
+        # Запускаємо гру
+        if current_profile["id"] and current_session_id is None:
+            current_session_id = start_session(current_profile["id"])
+        start_timer(reset=True)
+        update_action_ui()
+        update_board()
+        page.snack_bar = ft.SnackBar(ft.Text("Режим Пасьянс 2 розпочато"), open=True)
+        page.update()
+    
+    def initialize_duel_button():
+        nonlocal duel_button
+        duel_button = ft.ElevatedButton(
+            "Дуель 1",
+            width=220,
+            height=40,
+            on_click=lambda e: start_duel_mode(),
+        )
+        # Кнопка не видима до входу користувача
+        duel_button.visible = False
+    
+    def initialize_duel2_button():
+        nonlocal duel2_button
+        duel2_button = ft.ElevatedButton(
+            "Дуель 2",
+            width=220,
+            height=40,
+            on_click=lambda e: start_duel2_mode(),
+        )
+        # Кнопка не видима до входу користувача
+        duel2_button.visible = False
+    
+    def start_duel_mode():
+        """Заглушка для режиму дуелі (буде реалізовано пізніше)"""
+        nonlocal pattern_constructor_mode
+        pattern_constructor_mode = False  # Скидаємо режим конструктора
+        page.snack_bar = ft.SnackBar(ft.Text("Режим дуелі буде реалізовано"), open=True)
+        page.update()
+    
+    def start_duel2_mode():
+        """Заглушка для режиму дуелі 2 (буде реалізовано пізніше)"""
+        nonlocal pattern_constructor_mode
+        pattern_constructor_mode = False  # Скидаємо режим конструктора
+        page.snack_bar = ft.SnackBar(ft.Text("Режим дуелі 2 буде реалізовано"), open=True)
+        page.update()
 
     def load_tiles():
-        nonlocal start_button, current_session_id
+        nonlocal start_button, solitaire2_button, duel_button, duel2_button, current_session_id, solitaire2_slots, board, pattern_constructor_mode
+        global game_mode
+        game_mode = "solitaire1"
+        pattern_constructor_mode = False  # Скидаємо режим конструктора
+        solitaire2_slots = [None, None, None]  # Очищаємо слоти
+        
+        # Створюємо нову дошку з правильним game_mode для Пасьянс 1
+        board = Board()  # Створюємо нову дошку з game_mode="solitaire1"
+        
         start_button.visible = False
+        if solitaire2_button:
+            solitaire2_button.visible = False
+        if solitaire2_pattern_dropdown:
+            solitaire2_pattern_dropdown.visible = False
+        if duel_button:
+            duel_button.visible = False
+        if duel2_button:
+            duel2_button.visible = False
         if current_profile["id"] and current_session_id is None:
             current_session_id = start_session(current_profile["id"])
         start_timer(reset=True)
@@ -1943,25 +3324,237 @@ def main(page: ft.Page):
     
     def update_board():
         """Оновлює відображення дошки"""
-        nonlocal main_stack
+        global game_mode
+        nonlocal main_stack, sidebar_slots_area, tile_palette_container
         print(f"DEBUG update_board: current_profile['id']={current_profile['id']}")
+        print(f"DEBUG update_board: start_button={start_button}, start_button.visible={start_button.visible if start_button else 'None'}")
+        print(f"DEBUG update_board: duel_button={duel_button}, duel_button.visible={duel_button.visible if duel_button else 'None'}")
+        print(f"DEBUG update_board: board.game_over={board.game_over if board else 'None'}")
         board_container.controls.clear()
+        # Очищаємо панель тейлів, якщо конструктор не активний
+        if not pattern_constructor_mode:
+            tile_palette_container.controls.clear()
         
-        # Якщо користувач увійшов, але гра ще не почалася - показуємо кнопку режиму в верхньому лівому куті
+        # Якщо користувач увійшов, але гра ще не почалася - показуємо кнопки режимів в верхньому лівому куті
         if current_profile["id"] is not None and start_button and start_button.visible:
-            board_container.controls.append(
-                ft.Container(
-                    content=start_button,
-                    left=10,
-                    top=10,
-                )
+            print(f"DEBUG update_board: Показую рамочки з режимами")
+            # Заголовок для однокористувацького режиму
+            single_player_title = ft.Container(
+                content=ft.Text(
+                    "Однокористувацький режим",
+                    size=14,
+                    weight=ft.FontWeight.BOLD,
+                    color=TEXT_COLOR,
+                ),
+                left=10,
+                top=10,
             )
+            board_container.controls.append(single_player_title)
+            
+            # Рамочка для однокористувацького режиму (місце для 3 кнопок)
+            # Додаємо кнопки в список
+            single_player_buttons = [start_button]
+            if solitaire2_button and solitaire2_button.visible:
+                # Спочатку додаємо кнопку, потім випадаюче меню
+                single_player_buttons.append(solitaire2_button)
+                if solitaire2_pattern_dropdown:
+                    # Переконуємося, що меню видиме
+                    solitaire2_pattern_dropdown.visible = True
+                    # Вирівнюємо меню по центру рамочки (ширина рамочки 240, меню 200, padding 10, тому потрібно 10px зліва)
+                    dropdown_wrapper = ft.Container(
+                        content=solitaire2_pattern_dropdown,
+                        margin=ft.margin.only(left=10),  # Зсув вправо на 10px для центрування
+                    )
+                    single_player_buttons.append(dropdown_wrapper)
+            
+            single_player_frame = ft.Container(
+                content=ft.Column(
+                    controls=single_player_buttons,
+                    spacing=10,  # Відступ між кнопками
+                ),
+                width=240,  # 220 (ширина кнопки) + 20 (відступи)
+                height=200,  # Збільшено висоту для випадаючого меню
+                border=ft.border.all(1, "#000000"),  # Чорна тонка рамка
+                border_radius=5,
+                padding=ft.padding.all(10),
+                bgcolor=None,  # Прозорий фон
+                left=10,
+                top=40,  # 10 (відступ зверху) + 30 (висота заголовка)
+            )
+            board_container.controls.append(single_player_frame)
+            
+            # Рамочка для багатокористувацького режиму
+            if (duel_button and duel_button.visible) or (duel2_button and duel2_button.visible):
+                # Заголовок для багатокористувацького режиму
+                multiplayer_title = ft.Container(
+                    content=ft.Text(
+                        "Багатокористувацький режим",
+                        size=14,
+                        weight=ft.FontWeight.BOLD,
+                        color=TEXT_COLOR,
+                    ),
+                    left=10,
+                    top=260,  # 10 (відступ зверху) + 40 (заголовок) + 200 (висота першої рамочки) + 10 (відступ між заголовками)
+                )
+                board_container.controls.append(multiplayer_title)
+                
+                # Додаємо кнопки в список
+                multiplayer_buttons = []
+                if duel_button and duel_button.visible:
+                    multiplayer_buttons.append(duel_button)
+                if duel2_button and duel2_button.visible:
+                    # Додаємо контейнер з відступом зверху для кнопки "Дуель-2"
+                    duel2_wrapper = ft.Container(
+                        content=duel2_button,
+                        margin=ft.margin.only(top=-4),  # Піднімаємо на 4 пікселі вгору
+                    )
+                    multiplayer_buttons.append(duel2_wrapper)
+                
+                multiplayer_frame = ft.Container(
+                    content=ft.Column(
+                        controls=multiplayer_buttons,
+                        spacing=10,  # Відступ між кнопками
+                    ),
+                    width=240,  # 220 (ширина кнопки) + 20 (відступи)
+                    height=110 if len(multiplayer_buttons) > 1 else 80,  # 2 кнопки по 40px + відступи або 1 кнопка (збільшено на 10px)
+                    border=ft.border.all(1, "#000000"),  # Чорна тонка рамка
+                    border_radius=5,
+                    padding=ft.padding.all(10),
+                    bgcolor=None,  # Прозорий фон
+                    left=10,
+                    top=290,  # 10 (відступ зверху) + 40 (заголовок) + 200 (висота першої рамочки) + 40 (відступ між рамочками)
+                )
+                board_container.controls.append(multiplayer_frame)
+            
+            # Кнопка "Конструктор патернів" під рамочками
+            pattern_constructor_button = ft.ElevatedButton(
+                "Конструктор патернів",
+                width=240,
+                height=40,
+                bgcolor="#9C27B0",  # Фіолетовий колір
+                color="#FFFFFF",
+                on_click=lambda e: open_pattern_constructor(),
+            )
+            # Розраховуємо позицію в залежності від того, чи є багатокористувацький режим
+            has_multiplayer = (duel_button and duel_button.visible) or (duel2_button and duel2_button.visible)
+            multiplayer_height = 110 if ((duel_button and duel_button.visible) and (duel2_button and duel2_button.visible)) else 80
+            constructor_top = 290 + multiplayer_height + 20 if has_multiplayer else 270  # Під рамочкою багатокористувацького режиму або під однокористувацьким (опущено на 10px)
+            pattern_constructor_frame = ft.Container(
+                content=pattern_constructor_button,
+                left=10,
+                top=constructor_top,  # Під рамочками режимів з відступом
+            )
+            board_container.controls.append(pattern_constructor_frame)
+        # Якщо конструктор патернів активний
+        elif pattern_constructor_mode:
+            # Очищаємо комірки в прозорій зоні сайдбару для конструктора
+            if sidebar_slots_area.content is None or not isinstance(sidebar_slots_area.content, ft.Stack):
+                sidebar_slots_area.content = ft.Stack([])
+            else:
+                sidebar_slots_area.content.controls.clear()
+            # Показуємо поле конструктора
+            render_pattern_constructor()
         # Якщо гра активна - показуємо плитки
         elif current_profile["id"] is not None:
+            # Показуємо основні плитки
+            # Сортуємо за z (рівень), потім y, потім x - тейли з більшим z будуть зверху
             for tile in sorted(board.tiles, key=lambda t: (t.z, t.y, t.x)):
                 if not tile.removed:
                     tile_container = create_tile_container(tile)
+                    # Для Пасьянс 2 додаємо трохи меншу прозорість для нижніх рівнів (ефект глибини)
+                    if game_mode == "solitaire2" and tile.z > 0:
+                        # Нижні рівні трохи прозоріші для ефекту глибини
+                        tile_container.opacity = max(0.75, 1.0 - tile.z * 0.08)
                     board_container.controls.append(tile_container)
+            
+            # Якщо режим "Пасьянс 2" - додаємо три рамочки внизу справа (2 пусті + 1 заблокована)
+            # Якщо режим "Пасьянс 2" - додаємо три рамочки в прозорій частині сайдбару (2 пусті + 1 заблокована)
+            if game_mode == "solitaire2":
+                # Очищаємо старі комірки з прозорої частини сайдбару
+                if sidebar_slots_area.content is None or not isinstance(sidebar_slots_area.content, ft.Stack):
+                    sidebar_slots_area.content = ft.Stack([])
+                else:
+                    sidebar_slots_area.content.controls.clear()
+                # Знаходимо максимальні координати серед усіх тейлів
+                max_x = 0
+                max_y = 0
+                for tile in board.tiles:
+                    if not tile.removed:
+                        # Враховуємо зміщення для Пасьянс 2 (z-координата) при обчисленні позиції на екрані
+                        # Зміщення для шарів: трохи вгору і вправо для вищих рівнів
+                        z_offset_x = tile.z * 5 if game_mode == "solitaire2" else 0  # Зміщення вправо для вищих рівнів (5px на шар)
+                        z_offset_y = -tile.z * 5 if game_mode == "solitaire2" else 0  # Зміщення вгору для вищих рівнів (5px на шар)
+                        tile_screen_x = 10 + tile.x * TILE_SPACING_X + z_offset_x
+                        tile_screen_y = 10 + tile.y * TILE_SPACING_Y + z_offset_y  # Глобальний відступ зверху = 10
+                        if tile_screen_x > max_x:
+                            max_x = tile_screen_x
+                        if tile_screen_y > max_y:
+                            max_y = tile_screen_y
+                
+                # Розташовуємо рамочки всередині прозорої частини сайдбару (60px зліва)
+                # Комірки будуть рухатися разом з сайдбаром при зміні розміру вікна
+                # Комірки по лівому краю прозорої частини
+                slot_x = 0  # Позиція на лівому краю прозорої частини (60px достатньо для комірок шириною 50px)
+                
+                slot_spacing = 1  # Мінімальний відступ між рамочками (1 піксель)
+                # Розміщуємо комірки внизу контейнера sidebar_slots_area (висота = 730)
+                # 3 комірки по 70px висоти + 2 відступи по 1px = 212px загалом
+                slot_y_start = 730 - 3 * TILE_HEIGHT - 2 * slot_spacing  # Внизу контейнера
+                
+                # Не перевіряємо межі board_container, бо комірки мають бути на фіксованій позиції відносно сайдбару
+                
+                print(f"DEBUG solitaire2_slots: slot_x={slot_x}, slot_y_start={slot_y_start}, max_x={max_x}, max_y={max_y}, offset_right={SOLITAIRE2_SLOTS_OFFSET_RIGHT}")
+                
+                # Створюємо три рамочки
+                for i in range(3):
+                    slot_y = slot_y_start + i * (TILE_HEIGHT + slot_spacing)
+                    
+                    if i < 2:
+                        # Перші дві - пусті рамочки
+                        empty_slot = ft.Container(
+                            width=TILE_WIDTH,
+                            height=TILE_HEIGHT,
+                            left=slot_x,
+                            top=slot_y,
+                            border=ft.border.all(2, "#888888"),  # Сіра рамка
+                            border_radius=5,
+                            bgcolor="#2A2A2A",  # Темний фон для порожнього слота
+                            content=ft.Container(
+                                content=ft.Text("", size=12, color="#666666"),
+                                alignment=ft.alignment.center,
+                            ),
+                        )
+                    else:
+                        # Третя - заблокована з замочком
+                        locked_slot = ft.Container(
+                            width=TILE_WIDTH,
+                            height=TILE_HEIGHT,
+                            left=slot_x,
+                            top=slot_y,
+                            border=ft.border.all(2, "#666666"),  # Темніша рамка для заблокованого
+                            border_radius=5,
+                            bgcolor="#1A1A1A",  # Ще темніший фон
+                            content=ft.Container(
+                                content=ft.Icon(
+                                    name="lock",
+                                    size=24,
+                                    color="#666666",
+                                ),
+                                alignment=ft.alignment.center,
+                            ),
+                        )
+                        # Додаємо до прозорої частини сайдбару
+                        sidebar_slots_area.content.controls.append(locked_slot)
+                        continue
+                    
+                    # Додаємо до прозорої частини сайдбару
+                    sidebar_slots_area.content.controls.append(empty_slot)
+            else:
+                # Для Пасьянс 1 комірки не потрібні - очищаємо їх
+                if sidebar_slots_area.content is None or not isinstance(sidebar_slots_area.content, ft.Stack):
+                    sidebar_slots_area.content = ft.Stack([])
+                else:
+                    sidebar_slots_area.content.controls.clear()
         
         # Додаємо overlay елементи
         board_container.controls.append(pause_overlay)
@@ -1974,6 +3567,8 @@ def main(page: ft.Page):
         check_game_state()
 
     initialize_start_button()
+    initialize_duel_button()
+    initialize_duel2_button()
     
     # Початкове оновлення sidebar (без таблиці рекордів, якщо користувач не увійшов)
     update_sidebar()
@@ -1997,5 +3592,14 @@ def main(page: ft.Page):
 
 
 if __name__ == "__main__":
-    ft.app(target=main)
+    # Для веб-деплою на Render.com використовуємо WEB_BROWSER view
+    # Для локального запуску можна використати ft.AppView.FLET_APP
+    import os
+    port = int(os.getenv("PORT", 8000))  # Render надає PORT автоматично
+    if os.getenv("RENDER") or os.getenv("PORT"):
+        # Запуск на Render.com або іншому хостингу
+        ft.app(target=main, view=ft.AppView.WEB_BROWSER, port=port, host="0.0.0.0")
+    else:
+        # Локальний запуск
+        ft.app(target=main)
 
