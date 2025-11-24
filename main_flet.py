@@ -8,6 +8,7 @@ import json
 import random
 import threading
 import time
+import asyncio
 import sqlite3
 import hashlib
 import secrets
@@ -607,6 +608,10 @@ class Board:
             TileType.WAN_5, TileType.WAN_6, TileType.WAN_7, TileType.WAN_8, TileType.WAN_9,
             TileType.EAST, TileType.SOUTH, TileType.WEST, TileType.NORTH,
             TileType.RED_DRAGON, TileType.GREEN_DRAGON, TileType.WHITE_DRAGON,
+            # Всі дракони мають унікальні файли:
+            # RED_DRAGON -> pinyin1.png (червоний)
+            # GREEN_DRAGON -> pinyin2.png (зелений)
+            # WHITE_DRAGON -> pinyin16.png (жовтий)
             # Квіти та сезони
             TileType.FLOWER_PLUM, TileType.FLOWER_ORCHID, TileType.FLOWER_CHRYSANTHEMUM, TileType.FLOWER_BAMBOO,
             TileType.SEASON_SPRING, TileType.SEASON_SUMMER, TileType.SEASON_AUTUMN, TileType.SEASON_WINTER,
@@ -813,10 +818,40 @@ class Board:
         return pattern
     
     def is_tile_available(self, tile: Tile) -> bool:
-        """Перевіряє, чи плитка доступна (немає плиток зверху + хоч один берег вільний/має пару)"""
+        """Перевіряє, чи плитка доступна"""
+        global game_mode
+        
         if tile.removed:
             return False
         
+        # Для Пасьянс-2: тейл доступний, якщо він відкритий зліва АБО справа (або з обох сторін)
+        if game_mode == "solitaire2":
+            # Перевіряємо, чи немає плиток зверху (на тому ж x, y, але вищий z)
+            for other_tile in self.tiles:
+                if other_tile.removed:
+                    continue
+                if other_tile.x == tile.x and other_tile.y == tile.y and other_tile.z > tile.z:
+                    return False
+            
+            # Перевіряємо ліву та праву сторони
+            def has_neighbor(dx: int, dy: int) -> bool:
+                return any(
+                    other_tile is not tile
+                    and not other_tile.removed
+                    and other_tile.z == tile.z
+                    and other_tile.x == tile.x + dx
+                    and other_tile.y == tile.y + dy
+                    for other_tile in self.tiles
+                )
+            
+            left_blocked = has_neighbor(-1, 0)  # Зліва
+            right_blocked = has_neighbor(1, 0)  # Справа
+            
+            # Тейл доступний, якщо він відкритий зліва АБО справа (або з обох)
+            # Якщо закритий і зліва, і справа - недоступний
+            return not (left_blocked and right_blocked)
+        
+        # Для Пасьянс-1 та інших режимів - стандартна логіка
         # Перевіряємо, чи немає плиток зверху (на тому ж x, y, але вищий z)
         for other_tile in self.tiles:
             if other_tile.removed:
@@ -941,11 +976,17 @@ class Board:
                 self.selected_tile.selected = False
                 self.selected_tile = None
             elif self.selected_tile.tile_type == tile.tile_type:
-                # Знайдено однакові тейли - видаляємо їх
+                # Знайдено однакові тейли - перевіряємо, чи можна їх видалити
+                selected_available = self.is_tile_available(self.selected_tile)
+                clicked_available = self.is_tile_available(tile)
+                can_connect_result = self.can_connect(self.selected_tile, tile)
+                print(f"DEBUG click_tile solitaire1: selected_tile=({self.selected_tile.x},{self.selected_tile.y},{self.selected_tile.z}), tile_type={self.selected_tile.tile_type}")
+                print(f"DEBUG click_tile solitaire1: clicked_tile=({tile.x},{tile.y},{tile.z}), tile_type={tile.tile_type}")
+                print(f"DEBUG click_tile solitaire1: selected_available={selected_available}, clicked_available={clicked_available}, can_connect={can_connect_result}")
                 if (
-                    self.is_tile_available(self.selected_tile)
-                    and self.is_tile_available(tile)
-                    and self.can_connect(self.selected_tile, tile)
+                    selected_available
+                    and clicked_available
+                    and can_connect_result
                 ):
                     self.selected_tile.removed = True
                     tile.removed = True
@@ -953,6 +994,7 @@ class Board:
                     self.selected_tile = None
                 else:
                     # Якщо не можна з'єднати, вибираємо новий тейл
+                    print(f"DEBUG click_tile solitaire1: Не можна видалити пару - selected_available={selected_available}, clicked_available={clicked_available}, can_connect={can_connect_result}")
                     self.selected_tile.selected = False
                     self.selected_tile = tile
                     tile.selected = True
@@ -962,31 +1004,10 @@ class Board:
                 self.selected_tile = tile
                 tile.selected = True
         else:
-            # Для інших режимів (Пасьянс 2) - стандартна логіка
-            if self.selected_tile is None:
-                self.selected_tile = tile
-                tile.selected = True
-            elif self.selected_tile is tile:
-                self.selected_tile.selected = False
-                self.selected_tile = None
-            elif self.selected_tile.tile_type == tile.tile_type:
-                if (
-                    self.is_tile_available(self.selected_tile)
-                    and self.is_tile_available(tile)
-                    and self.can_connect(self.selected_tile, tile)
-                ):
-                    self.selected_tile.removed = True
-                    tile.removed = True
-                    self.selected_tile.selected = False
-                    self.selected_tile = None
-                else:
-                    self.selected_tile.selected = False
-                    self.selected_tile = tile
-                    tile.selected = True
-            else:
-                self.selected_tile.selected = False
-                self.selected_tile = tile
-                tile.selected = True
+            # Для Пасьянс 2 - нова логіка з комірками
+            # Тейли прибираються по одному в комірки, а не парами одразу
+            # selected_tile не використовується для solitaire2
+            pass  # Логіка буде в tile_clicked
     
     def has_possible_moves(self) -> bool:
         """Чи є хоча б одна пара, яку можна з’єднати з <= max_turns поворотів"""
@@ -1073,22 +1094,22 @@ def main(page: ft.Page):
             TileType.DOT_7: ["circle7.png"],
             TileType.DOT_8: ["circle8.png"],
             TileType.DOT_9: ["circle9.png"],
-            TileType.WAN_1: ["pinyin1.png"],
-            TileType.WAN_2: ["pinyin2.png"],
-            TileType.WAN_3: ["pinyin3.png"],
-            TileType.WAN_4: ["pinyin4.png"],
-            TileType.WAN_5: ["pinyin5.png"],
-            TileType.WAN_6: ["pinyin6.png"],
-            TileType.WAN_7: ["pinyin7.png"],
-            TileType.WAN_8: ["pinyin8.png"],
-            TileType.WAN_9: ["pinyin9.png"],
-            TileType.EAST: ["pinyin10.png"],  # Ton
-            TileType.SOUTH: ["pinyin11.png"],  # Nan
-            TileType.WEST: ["pinyin12.png"],  # Shaa
-            TileType.NORTH: ["pinyin13.png"],  # Pei
-            TileType.RED_DRAGON: ["pinyin14.png"],  # Chun
-            TileType.GREEN_DRAGON: ["pinyin15.png"],  # Hatsu
-            TileType.WHITE_DRAGON: ["pinyin15.png", "pinyin14.png"],  # Haku (може бути відсутній, використовуємо fallback)
+            TileType.WAN_1: ["pinyin13.png"],  # 一萬
+            TileType.WAN_2: ["pinyin14.png"],  # 二萬
+            TileType.WAN_3: ["pinyin15.png"],  # 三萬
+            TileType.WAN_4: ["pinyin7.png"],   # 四萬
+            TileType.WAN_5: ["pinyin8.png"],   # 伍萬
+            TileType.WAN_6: ["pinyin9.png"],   # 六萬
+            TileType.WAN_7: ["pinyin10.png"],  # 七萬
+            TileType.WAN_8: ["pinyin11.png"],  # 八萬
+            TileType.WAN_9: ["pinyin12.png"],  # 九萬
+            TileType.EAST: ["pinyin4.png"],    # 東
+            TileType.SOUTH: ["pinyin3.png"],   # 南
+            TileType.WEST: ["pinyin6.png"],    # 西
+            TileType.NORTH: ["pinyin5.png"],   # 北
+            TileType.RED_DRAGON: ["pinyin1.png"],  # 中 (Chun) - червоний дракон
+            TileType.GREEN_DRAGON: ["pinyin2.png"],  # 發 (Hatsu) - зелений дракон
+            TileType.WHITE_DRAGON: ["pinyin16.png"],  # 白 (Haku) - білий/жовтий дракон (унікальний файл)
             # Квіти та сезони
             TileType.FLOWER_PLUM: ["peony.png"],
             TileType.FLOWER_ORCHID: ["orchid.png"],
@@ -1144,6 +1165,20 @@ def main(page: ft.Page):
         for file_path in tiles_dir.glob("*.png"):
             existing_files[file_path.name.lower()] = file_path
         
+        # Перевіряємо на конфлікти - один файл для кількох типів
+        file_to_types = {}  # file -> list of tile_types
+        for tile_type, possible_names in tile_file_mapping.items():
+            for filename in possible_names:
+                file_key = filename.lower()
+                if file_key not in file_to_types:
+                    file_to_types[file_key] = []
+                file_to_types[file_key].append(tile_type)
+        
+        # Виводимо попередження про конфлікти
+        for file_key, types in file_to_types.items():
+            if len(types) > 1:
+                print(f"WARNING: Файл {file_key} використовується для кількох типів тейлів: {[t.name for t in types]}")
+        
         for tile_type, possible_names in tile_file_mapping.items():
             for filename in possible_names:
                 file_path = tiles_dir / filename
@@ -1152,6 +1187,7 @@ def main(page: ft.Page):
                         file_path = existing_files[filename.lower()]
                     try:
                         tile_images[tile_type] = str(file_path)
+                        print(f"DEBUG load_tiles: {tile_type.name} -> {file_path.name}")
                         break
                     except:
                         pass
@@ -1174,6 +1210,8 @@ def main(page: ft.Page):
     duel_button: Optional[ft.ElevatedButton] = None
     duel2_button: Optional[ft.ElevatedButton] = None
     solitaire2_slots: List[Optional[Tile]] = [None, None, None]  # Три слоти для тейлів у Пасьянс 2 (третій заблокований)
+    solitaire2_last_move: Optional[Dict[str, Any]] = None  # Останній хід для відміни: {"tile": Tile, "x": int, "y": int, "z": int, "slot_index": int} або None
+    solitaire2_pending_removal: bool = False  # Прапор, що вказує, що чекаємо перед видаленням однакових тейлів
     selected_solitaire2_pattern: Optional[str] = None  # Вибраний патерн для solitaire2
     selected_solitaire2_pattern: Optional[str] = None  # Вибраний патерн для solitaire2
     timer_text = ft.Text("00:00", size=24, weight=ft.FontWeight.BOLD, color=TEXT_COLOR)
@@ -1205,14 +1243,8 @@ def main(page: ft.Page):
         content=ft.Text("Пауза", size=36, weight=ft.FontWeight.BOLD, color=TEXT_COLOR),
         visible=False,
     )
-    results_overlay = ft.Container(
-        expand=True,
-        bgcolor="#222222",
-        opacity=0,
-        visible=False,
-        alignment=ft.alignment.center,
-        content=ft.Column([], spacing=8, alignment=ft.MainAxisAlignment.CENTER),
-    )
+    # Простий напис на полі замість великого вікна
+    finish_text_container: Optional[ft.Container] = None
     leaderboard_table = ft.DataTable(
         columns=[
             ft.DataColumn(
@@ -1527,17 +1559,10 @@ def main(page: ft.Page):
     def refresh_profile_stats():
         if not current_profile["id"]:
             games_label.value = "Ігор: 0"
-            best_time_label.value = "Найкращий час: --:--"
             sidebar_best_date_label.value = "--"
             return
         stats = fetch_profile_stats(current_profile["id"])
         games_label.value = f"Ігор: {stats['games']}"
-        best_time_text = (
-            format_duration(stats['best'])
-            if stats["best"] is not None
-            else "--:--"
-        )
-        best_time_label.value = f"Найкращий час: {best_time_text}"
         # Форматуємо дату кращого рекорду
         if stats.get("best_date"):
             date_text = format_timestamp(stats["best_date"])
@@ -1728,7 +1753,7 @@ def main(page: ft.Page):
 
     def start_new_game(e=None, show_notification=True):
         nonlocal board, hints_remaining, shuffle_remaining, timer_started, elapsed_seconds, start_time
-        nonlocal current_session_id, solitaire2_slots
+        nonlocal current_session_id, solitaire2_slots, finish_text_container
         global game_mode
         timer_control.stop()
         # Створюємо нову дошку з поточним game_mode (який вже встановлений)
@@ -1741,11 +1766,14 @@ def main(page: ft.Page):
         timer_text.value = format_duration(0)
         pause_overlay.visible = False
         pause_overlay.opacity = 0
-        results_overlay.visible = False
-        results_overlay.opacity = 0
+        # Приховуємо напис фінішу при старті нової гри
+        if finish_text_container:
+            finish_text_container.visible = False
         board_container.opacity = 1
         # Очищаємо слоти для Пасьянс 2
         solitaire2_slots = [None, None, None]
+        solitaire2_last_move = None
+        solitaire2_pending_removal = False
         # Приховуємо кнопки режимів, бо гра починається
         if start_button:
             start_button.visible = False
@@ -1807,21 +1835,33 @@ def main(page: ft.Page):
         if duel_button:
             duel_button.visible = True
         
-        detail_text = [
-            ft.Text("Фініш", size=30, weight=ft.FontWeight.BOLD, color=TEXT_COLOR),
-            ft.Text(f"Час: {format_duration(record_duration)}", size=20, color=TEXT_COLOR),
-            ft.Text(
-                "Новий рекорд!" if new_record else "Рекорд не побито",
-                color=HINT_COLOR if new_record else "#999",
+        # Створюємо простий напис на полі замість великого вікна
+        nonlocal finish_text_container
+        finish_text_container = ft.Container(
+            content=ft.Column(
+                [
+                    ft.Text("Фініш", size=24, weight=ft.FontWeight.BOLD, color=TEXT_COLOR, text_align=ft.TextAlign.CENTER),
+                    ft.Text(f"Час: {format_duration(record_duration)}", size=18, color=TEXT_COLOR, text_align=ft.TextAlign.CENTER),
+                    ft.Text(
+                        "Новий рекорд!" if new_record else "",
+                        size=16,
+                        color=HINT_COLOR if new_record else "#999",
+                        text_align=ft.TextAlign.CENTER,
+                    ),
+                ],
+                spacing=8,
+                alignment=ft.MainAxisAlignment.CENTER,
+                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
             ),
-        ]
-        new_game_button = ft.ElevatedButton("Нова гра", on_click=start_new_game)
-        results_overlay.content.controls = detail_text + [new_game_button]
-        results_overlay.visible = True
-        results_overlay.opacity = 0.95
-        board_container.opacity = 1
-        pause_overlay.visible = False
-        pause_overlay.opacity = 0
+            left=400,  # Центруємо на полі (приблизно)
+            top=300,
+            width=300,
+            height=150,
+            bgcolor="#222222CC",  # Напівпрозорий темний фон
+            border_radius=10,
+            border=ft.border.all(2, TEXT_COLOR),
+            alignment=ft.alignment.center,
+        )
         page.snack_bar = ft.SnackBar(ft.Text(f"Гра завершена: {result_label}"), open=True)
         update_action_ui()
         update_board()
@@ -1936,9 +1976,14 @@ def main(page: ft.Page):
             return
         if reshuffle_prompt_open:
             return
-        if not board.has_possible_moves():
-            show_reshuffle_prompt()
-        results_overlay.visible = False
+        # Для solitaire2 не перевіряємо has_possible_moves, бо логіка інша
+        if game_mode != "solitaire2":
+            if not board.has_possible_moves():
+                show_reshuffle_prompt()
+        # Приховуємо напис фінішу
+        nonlocal finish_text_container
+        if finish_text_container:
+            finish_text_container.visible = False
 
     refresh_records_table()
 
@@ -2123,9 +2168,12 @@ def main(page: ft.Page):
     
     def show_modes_page_internal():
         """Внутрішня функція для показу сторінки вибору режимів"""
-        nonlocal start_button, solitaire2_button, duel_button, duel2_button, board, current_session_id, pattern_constructor_mode
+        nonlocal start_button, solitaire2_button, duel_button, duel2_button, board, current_session_id, pattern_constructor_mode, finish_text_container
         print(f"DEBUG show_modes_page_internal: Викликано")
         pattern_constructor_mode = False  # Скидаємо режим конструктора при показі режимів
+        # Приховуємо напис фінішу при виборі режимів
+        if finish_text_container:
+            finish_text_container.visible = False
         
         # Ініціалізуємо кнопки, якщо вони ще не ініціалізовані
         if start_button is None:
@@ -2831,7 +2879,10 @@ def main(page: ft.Page):
     
     def show_modes_page(e):
         """Показує сторінку вибору режимів та ігор"""
-        nonlocal start_button, duel_button, duel2_button, board, current_session_id, end_game_overlay
+        nonlocal start_button, duel_button, duel2_button, board, current_session_id, end_game_overlay, finish_text_container
+        # Приховуємо напис фінішу при виборі режимів
+        if finish_text_container:
+            finish_text_container.visible = False
         print(f"DEBUG show_modes_page: Викликано")
         print(f"DEBUG show_modes_page: current_profile['id']={current_profile['id']}")
         print(f"DEBUG show_modes_page: board={board}")
@@ -2902,19 +2953,69 @@ def main(page: ft.Page):
     
     # Розділяємо sidebar на 3 частини
     # Частина 1: Інформація про користувача та кнопки
+    def logout_user(e):
+        """Вихід користувача з акаунту"""
+        nonlocal current_profile, current_session_id, game_records, profile_label, auth_overlay_container
+        # Закриваємо поточну сесію, якщо вона активна
+        if current_session_id is not None:
+            end_session(current_session_id, "Вихід", hints_used=0, shuffle_used=0)
+            current_session_id = None
+        
+        # Скидаємо профіль
+        current_profile["id"] = None
+        current_profile["username"] = None
+        profile_label.value = "Гравець: (не вхід)"
+        game_records = []
+        
+        # Оновлюємо статистику
+        refresh_profile_stats()
+        refresh_records_table()
+        
+        # Оновлюємо sidebar
+        update_sidebar()
+        
+        # Показуємо діалог входу
+        show_auth_dialog()
+        
+        # Оновлюємо дошку
+        update_board()
+        page.update()
+    
+    logout_button = ft.ElevatedButton(
+        "Вийти",
+        width=180,
+        bgcolor="#FF6B6B",
+        color="#FFFFFF",
+        on_click=logout_user,
+    )
+    
     sidebar_part1 = ft.Container(
         content=ft.Column(
             [
+                # Блок 1: Інформація про користувача
                 profile_label,
-                ft.Row([games_label, best_time_label], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+                games_label,
+                logout_button,
+                ft.Divider(height=1, color="#2b2b2b"),  # Розділювач між блоками
+                # Блок 2: Кнопки гри
                 hint_button,
                 shuffle_button,
                 pause_button,
                 leaderboard_button,
                 admin_button,  # Адмінська кнопка для тестування
-                ft.Divider(height=1, color="#2b2b2b"),
-                ft.Text("Таймер", size=16, weight=ft.FontWeight.BOLD, color=TEXT_COLOR),
-                timer_text,
+                ft.Divider(height=1, color="#2b2b2b"),  # Розділювач перед таймером
+                ft.Container(
+                    content=ft.Column(
+                        [
+                            ft.Text("Таймер", size=16, weight=ft.FontWeight.BOLD, color=TEXT_COLOR),
+                            timer_text,
+                        ],
+                        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                        spacing=8,
+                        tight=True,
+                    ),
+                    alignment=ft.alignment.center,
+                ),
             ],
             spacing=8,  # Зменшено spacing з 12 до 8
             tight=True,
@@ -3090,12 +3191,11 @@ def main(page: ft.Page):
             height=TILE_HEIGHT,
             border=ft.border.all(border_width, border_color) if border_color else None,
             border_radius=5,
-            # Додаємо тінь для 3D ефекту (без білого фону)
             shadow=ft.BoxShadow(
                 spread_radius=1,
                 blur_radius=8,
-                color="#00000066",  # Напівпрозора чорна тінь
-                offset=ft.Offset(2, 3),  # Зсув тіні вправо-вниз
+                color="#00000066",
+                offset=ft.Offset(2, 3),
             ),
             opacity=1.0,
             on_click=lambda e, t=tile: tile_clicked(t),
@@ -3107,6 +3207,8 @@ def main(page: ft.Page):
     def tile_clicked(tile: Tile):
         """Обробник кліку по плитці"""
         global game_mode
+        nonlocal solitaire2_slots, solitaire2_last_move
+        
         # Перевіряємо, чи гра почалася
         if start_button and start_button.visible:
             return
@@ -3120,12 +3222,174 @@ def main(page: ft.Page):
         nonlocal timer_started
         if not timer_started and not board.game_over:
             start_timer(reset=True)
-        # Для Пасьянс 1 не очищаємо highlights, бо вони встановлюються в click_tile
-        # Для інших режимів очищаємо
-        if game_mode != "solitaire1":
+        
+        # Для Пасьянс 2 - нова логіка з комірками
+        if game_mode == "solitaire2":
+            nonlocal solitaire2_last_move, solitaire2_slots
+            
+            # Перевіряємо, чи тейл доступний для видалення
+            is_available = board.is_tile_available(tile)
+            print(f"DEBUG tile_clicked solitaire2: tile=({tile.x},{tile.y},{tile.z}), tile_type={tile.tile_type}, is_available={is_available}, removed={tile.removed}")
+            if not is_available or tile.removed:
+                print(f"DEBUG tile_clicked solitaire2: Тейл недоступний або вже видалений")
+                return
+            
+            # Перевіряємо, чи натиснутий тейл відповідає одному з тейлів у комірках
+            # Якщо так - видаляємо обидва (обраний на полі тейл і однаковий з комірки)
+            slot_tile = None
+            slot_index = None
+            print(f"DEBUG tile_clicked solitaire2: Перевіряю комірки для тейла типу {tile.tile_type} (значення: {tile.tile_type.value if hasattr(tile.tile_type, 'value') else tile.tile_type})")
+            print(f"DEBUG tile_clicked solitaire2: Стан комірок: slot0={solitaire2_slots[0] is not None}, slot1={solitaire2_slots[1] is not None}")
+            for i, slot_t in enumerate(solitaire2_slots[:2]):  # Тільки перші 2 комірки (третя заблокована)
+                if slot_t is not None:
+                    slot_type_val = slot_t.tile_type.value if hasattr(slot_t.tile_type, 'value') else slot_t.tile_type
+                    tile_type_val = tile.tile_type.value if hasattr(tile.tile_type, 'value') else tile.tile_type
+                    is_match = slot_t.tile_type == tile.tile_type
+                    print(f"DEBUG tile_clicked solitaire2: Комірка {i}: tile_type={slot_t.tile_type} (значення: {slot_type_val}), порівняння з {tile.tile_type} (значення: {tile_type_val}): {is_match}")
+                    if is_match:
+                        print(f"DEBUG tile_clicked solitaire2: ✓ Знайдено відповідний тейл у комірці {i} - видаляю обидва")
+                        slot_tile = slot_t
+                        slot_index = i
+                        break
+                else:
+                    print(f"DEBUG tile_clicked solitaire2: Комірка {i}: порожня")
+            
+            if slot_tile is not None:
+                # Знайдено відповідний тейл у комірці - видаляємо обидва
+                # Очищаємо історію, бо хід завершено (тейли видалено)
+                solitaire2_last_move = None
+                
+                tile.removed = True
+                slot_tile.removed = True
+                solitaire2_slots[slot_index] = None
+                update_board()
+                page.update()
+                check_game_state()
+                return
+            
+            # Якщо немає відповідного тейла, переміщуємо тейл у комірку
+            # Знаходимо вільну комірку (якщо обидві вільні - використовуємо верхню, тобто індекс 0)
+            print(f"DEBUG tile_clicked solitaire2: Перевіряю комірки: slot0={solitaire2_slots[0] is not None}, slot1={solitaire2_slots[1] is not None}")
+            slot_index = None
+            if solitaire2_slots[0] is None:
+                # Верхня комірка вільна
+                print(f"DEBUG tile_clicked solitaire2: Переміщую тейл у верхню комірку")
+                slot_index = 0
+                solitaire2_slots[0] = tile
+                tile.removed = True  # Прибираємо з поля (не відображається на полі, але зберігається в комірці)
+            elif solitaire2_slots[1] is None:
+                # Нижня комірка вільна
+                print(f"DEBUG tile_clicked solitaire2: Переміщую тейл у нижню комірку")
+                slot_index = 1
+                solitaire2_slots[1] = tile
+                tile.removed = True  # Прибираємо з поля
+            else:
+                # Обидві комірки зайняті - не можна додати новий тейл
+                print(f"DEBUG tile_clicked solitaire2: Обидві комірки зайняті")
+                return
+            
+            # Зберігаємо останній хід для можливості відміни (тільки один хід)
+            solitaire2_last_move = {
+                "tile": tile,
+                "x": tile.x,
+                "y": tile.y,
+                "z": tile.z,
+                "slot_index": slot_index
+            }
+            
+            # Оновлюємо дошку, щоб показати тейл у комірці
+            update_board()
+            page.update()
+            
+            # Перевіряємо, чи в обох комірках тейли однакові
+            # Якщо так - чекаємо 1 секунду перед видаленням
+            nonlocal solitaire2_pending_removal
+            print(f"DEBUG tile_clicked solitaire2: Перевіряю на однаковість: slot0={solitaire2_slots[0] is not None}, slot1={solitaire2_slots[1] is not None}")
+            if solitaire2_slots[0] is not None and solitaire2_slots[1] is not None:
+                print(f"DEBUG tile_clicked solitaire2: Обидві комірки заповнені, порівнюю типи: slot0.tile_type={solitaire2_slots[0].tile_type}, slot1.tile_type={solitaire2_slots[1].tile_type}")
+                print(f"DEBUG tile_clicked solitaire2: Порівняння: {solitaire2_slots[0].tile_type == solitaire2_slots[1].tile_type}")
+                if solitaire2_slots[0].tile_type == solitaire2_slots[1].tile_type:
+                    # Однакові тейли - встановлюємо прапор і чекаємо 1 секунду перед видаленням
+                    solitaire2_pending_removal = True
+                    print(f"DEBUG tile_clicked solitaire2: Знайдено однакові тейли, запускаю затримку 0.3 секунди")
+                    
+                    # Функція для видалення однакових тейлів після затримки
+                    def remove_matching_tiles():
+                        nonlocal solitaire2_slots, solitaire2_last_move, solitaire2_pending_removal
+                        print(f"DEBUG remove_matching_tiles: Затримка завершена, перевіряю тейли перед видаленням")
+                        if solitaire2_pending_removal and solitaire2_slots[0] is not None and solitaire2_slots[1] is not None:
+                            if solitaire2_slots[0].tile_type == solitaire2_slots[1].tile_type:
+                                print(f"DEBUG remove_matching_tiles: Видаляю однакові тейли")
+                                # Однакові тейли - видаляємо обидва
+                                solitaire2_pending_removal = False
+                                solitaire2_last_move = None
+                                solitaire2_slots[0] = None
+                                solitaire2_slots[1] = None
+                                # Оновлюємо UI через page.run_task (async функція)
+                                async def update_ui():
+                                    update_board()
+                                    page.update()
+                                    check_game_state()
+                                page.run_task(update_ui)
+                            else:
+                                print(f"DEBUG remove_matching_tiles: Тейли вже не однакові, не видаляю")
+                                solitaire2_pending_removal = False
+                        else:
+                            print(f"DEBUG remove_matching_tiles: Прапор не встановлений або одна з комірок порожня, не видаляю")
+                            solitaire2_pending_removal = False
+                    
+                    # Запускаємо через threading.Timer (0.3 секунди)
+                    timer = threading.Timer(0.3, remove_matching_tiles)
+                    timer.start()
+                    return  # Виходимо, не викликаючи check_game_state зараз
+            
+            check_game_state()
+            return
+        
+        # Для Пасьянс 1 та інших режимів - стандартна логіка
+        if game_mode == "solitaire1":
+            # Для solitaire1 використовуємо стандартну логіку через board.click_tile
+            board.click_tile(tile)
+            update_board()
+        else:
+            # Для інших режимів (якщо не solitaire2)
             board.clear_highlights()
-        board.click_tile(tile)
+            selected_before = board.selected_tile
+            board.click_tile(tile)
+            update_board()
+    
+    def undo_last_move_solitaire2():
+        """Відміняє останній хід в Пасьянс-2"""
+        nonlocal solitaire2_last_move, solitaire2_slots
+        
+        if solitaire2_last_move is None:
+            # Немає ходу для відміни
+            return
+        
+        # Відновлюємо тейл на попереднє місце
+        tile = solitaire2_last_move["tile"]
+        slot_index = solitaire2_last_move["slot_index"]
+        
+        # Перевіряємо, чи тейл все ще в комірці
+        if solitaire2_slots[slot_index] != tile:
+            # Тейл вже не в комірці (можливо, був видалений разом з іншим)
+            solitaire2_last_move = None
+            return
+        
+        # Повертаємо тейл на поле
+        tile.x = solitaire2_last_move["x"]
+        tile.y = solitaire2_last_move["y"]
+        tile.z = solitaire2_last_move["z"]
+        tile.removed = False
+        
+        # Очищаємо комірку
+        solitaire2_slots[slot_index] = None
+        
+        # Очищаємо історію (можна відмінити тільки один хід)
+        solitaire2_last_move = None
+        
         update_board()
+        page.update()
     
     start_button: Optional[ft.ElevatedButton]
     solitaire2_button: Optional[ft.ElevatedButton]
@@ -3214,10 +3478,15 @@ def main(page: ft.Page):
         """Запускає режим Пасьянс 2 з вибраним патерном"""
         nonlocal solitaire2_button, solitaire2_pattern_dropdown, current_session_id, solitaire2_slots, board, pattern_constructor_mode
         nonlocal hints_remaining, shuffle_remaining, timer_started, elapsed_seconds, start_time, selected_solitaire2_pattern
+        nonlocal finish_text_container
         global game_mode
         game_mode = "solitaire2"
         pattern_constructor_mode = False  # Скидаємо режим конструктора
-        solitaire2_slots = [None, None, None]  # Очищаємо слоти
+        solitaire2_slots = [None, None, None]
+        solitaire2_last_move = None  # Очищаємо слоти
+        # Приховуємо напис фінішу при виборі нового режиму
+        if finish_text_container:
+            finish_text_container.visible = False
         
         # Використовуємо вибраний патерн з меню, якщо не вказано явно
         if not pattern_name and selected_solitaire2_pattern:
@@ -3249,8 +3518,9 @@ def main(page: ft.Page):
         timer_text.value = format_duration(0)
         pause_overlay.visible = False
         pause_overlay.opacity = 0
-        results_overlay.visible = False
-        results_overlay.opacity = 0
+        # Приховуємо напис фінішу при старті нової гри
+        if finish_text_container:
+            finish_text_container.visible = False
         board_container.opacity = 1
         
         # Запускаємо гру
@@ -3299,11 +3569,15 @@ def main(page: ft.Page):
         page.update()
 
     def load_tiles():
-        nonlocal start_button, solitaire2_button, duel_button, duel2_button, current_session_id, solitaire2_slots, board, pattern_constructor_mode
+        nonlocal start_button, solitaire2_button, duel_button, duel2_button, current_session_id, solitaire2_slots, board, pattern_constructor_mode, finish_text_container
         global game_mode
         game_mode = "solitaire1"
         pattern_constructor_mode = False  # Скидаємо режим конструктора
-        solitaire2_slots = [None, None, None]  # Очищаємо слоти
+        solitaire2_slots = [None, None, None]
+        solitaire2_last_move = None  # Очищаємо слоти
+        # Приховуємо напис фінішу при виборі нового режиму
+        if finish_text_container:
+            finish_text_container.visible = False
         
         # Створюємо нову дошку з правильним game_mode для Пасьянс 1
         board = Board()  # Створюємо нову дошку з game_mode="solitaire1"
@@ -3325,7 +3599,7 @@ def main(page: ft.Page):
     def update_board():
         """Оновлює відображення дошки"""
         global game_mode
-        nonlocal main_stack, sidebar_slots_area, tile_palette_container
+        nonlocal main_stack, sidebar_slots_area, tile_palette_container, solitaire2_last_move
         print(f"DEBUG update_board: current_profile['id']={current_profile['id']}")
         print(f"DEBUG update_board: start_button={start_button}, start_button.visible={start_button.visible if start_button else 'None'}")
         print(f"DEBUG update_board: duel_button={duel_button}, duel_button.visible={duel_button.visible if duel_button else 'None'}")
@@ -3461,10 +3735,7 @@ def main(page: ft.Page):
             for tile in sorted(board.tiles, key=lambda t: (t.z, t.y, t.x)):
                 if not tile.removed:
                     tile_container = create_tile_container(tile)
-                    # Для Пасьянс 2 додаємо трохи меншу прозорість для нижніх рівнів (ефект глибини)
-                    if game_mode == "solitaire2" and tile.z > 0:
-                        # Нижні рівні трохи прозоріші для ефекту глибини
-                        tile_container.opacity = max(0.75, 1.0 - tile.z * 0.08)
+                    # Всі тейли мають повну непрозорість (opacity=1.0 вже встановлено в create_tile_container)
                     board_container.controls.append(tile_container)
             
             # Якщо режим "Пасьянс 2" - додаємо три рамочки внизу справа (2 пусті + 1 заблокована)
@@ -3510,20 +3781,66 @@ def main(page: ft.Page):
                     slot_y = slot_y_start + i * (TILE_HEIGHT + slot_spacing)
                     
                     if i < 2:
-                        # Перші дві - пусті рамочки
-                        empty_slot = ft.Container(
-                            width=TILE_WIDTH,
-                            height=TILE_HEIGHT,
-                            left=slot_x,
-                            top=slot_y,
-                            border=ft.border.all(2, "#888888"),  # Сіра рамка
-                            border_radius=5,
-                            bgcolor="#2A2A2A",  # Темний фон для порожнього слота
-                            content=ft.Container(
-                                content=ft.Text("", size=12, color="#666666"),
-                                alignment=ft.alignment.center,
-                            ),
-                        )
+                        # Перші дві - рамочки з тейлами або порожні
+                        slot_tile = solitaire2_slots[i]
+                        if slot_tile is not None:
+                            # У комірці є тейл - відображаємо його (без можливості кліку)
+                            # Створюємо контейнер для тейла в комірці
+                            if slot_tile.tile_type in tile_images:
+                                tile_content = ft.Image(
+                                    src=tile_images[slot_tile.tile_type],
+                                    width=TILE_WIDTH,
+                                    height=TILE_HEIGHT,
+                                    fit=ft.ImageFit.CONTAIN,
+                                )
+                            else:
+                                tile_content = ft.Container(
+                                    content=ft.Text(
+                                        slot_tile.get_display_name(),
+                                        size=16,
+                                        color="#000000",
+                                        text_align=ft.TextAlign.CENTER,
+                                    ),
+                                    alignment=ft.alignment.center,
+                                    width=TILE_WIDTH,
+                                    height=TILE_HEIGHT,
+                                    bgcolor=TILE_COLOR,
+                                )
+                            
+                            slot_tile_container = ft.Container(
+                                content=tile_content,
+                                left=slot_x,
+                                top=slot_y,
+                                width=TILE_WIDTH,
+                                height=TILE_HEIGHT,
+                                border=ft.border.all(1, "#888888"),
+                                border_radius=5,
+                                shadow=ft.BoxShadow(
+                                    spread_radius=1,
+                                    blur_radius=8,
+                                    color="#00000066",
+                                    offset=ft.Offset(2, 3),
+                                ),
+                                opacity=1.0,
+                                # Без on_click - тейли в комірках не клікабельні
+                            )
+                            sidebar_slots_area.content.controls.append(slot_tile_container)
+                        else:
+                            # Порожня рамочка
+                            empty_slot = ft.Container(
+                                width=TILE_WIDTH,
+                                height=TILE_HEIGHT,
+                                left=slot_x,
+                                top=slot_y,
+                                border=ft.border.all(2, "#888888"),  # Сіра рамка
+                                border_radius=5,
+                                bgcolor="#2A2A2A",  # Темний фон для порожнього слота
+                                content=ft.Container(
+                                    content=ft.Text("", size=12, color="#666666"),
+                                    alignment=ft.alignment.center,
+                                ),
+                            )
+                            sidebar_slots_area.content.controls.append(empty_slot)
                     else:
                         # Третя - заблокована з замочком
                         locked_slot = ft.Container(
@@ -3546,9 +3863,29 @@ def main(page: ft.Page):
                         # Додаємо до прозорої частини сайдбару
                         sidebar_slots_area.content.controls.append(locked_slot)
                         continue
-                    
-                    # Додаємо до прозорої частини сайдбару
-                    sidebar_slots_area.content.controls.append(empty_slot)
+                
+                # Створюємо кнопку "відмінити хід" над комірками (після створення комірок)
+                # slot_y_start - це Y координата першої комірки, відступаємо на 100px вгору
+                undo_button_y = slot_y_start - 100
+                undo_button = ft.Container(
+                    content=ft.IconButton(
+                        icon="undo",
+                        icon_size=32,
+                        icon_color=TEXT_COLOR if solitaire2_last_move is not None else "#666666",  # Сірий, якщо немає ходу для відміни
+                        tooltip="Відмінити хід",
+                        disabled=solitaire2_last_move is None,  # Неактивна, якщо немає ходу для відміни
+                        on_click=lambda e: undo_last_move_solitaire2(),
+                    ),
+                    left=slot_x,
+                    top=undo_button_y,
+                    width=TILE_WIDTH,
+                    height=TILE_HEIGHT,
+                    border=ft.border.all(2, "#888888" if solitaire2_last_move is not None else "#666666"),  # Рамка як у комірки
+                    border_radius=5,
+                    bgcolor="#2A2A2A",  # Темний фон як у комірки
+                    alignment=ft.alignment.center,  # Центруємо іконку
+                )
+                sidebar_slots_area.content.controls.append(undo_button)
             else:
                 # Для Пасьянс 1 комірки не потрібні - очищаємо їх
                 if sidebar_slots_area.content is None or not isinstance(sidebar_slots_area.content, ft.Stack):
@@ -3556,9 +3893,12 @@ def main(page: ft.Page):
                 else:
                     sidebar_slots_area.content.controls.clear()
         
-        # Додаємо overlay елементи
-        board_container.controls.append(pause_overlay)
-        board_container.controls.append(results_overlay)
+        # Додаємо overlay елементи (перевіряємо, чи вони ще не додані)
+        if pause_overlay not in board_container.controls:
+            board_container.controls.append(pause_overlay)
+        # Додаємо напис фінішу, якщо він існує і ще не доданий
+        if finish_text_container and finish_text_container not in board_container.controls:
+            board_container.controls.append(finish_text_container)
         
         # Оновлюємо сторінку
         update_action_ui()

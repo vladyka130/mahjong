@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: mahjong-solitaire
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main_flet.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+
